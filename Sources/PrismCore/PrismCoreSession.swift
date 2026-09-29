@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import Libavcodec
 
 /// One playback session: remux `sourceURL` into HLS-fMP4 on disk and serve it
 /// from the loopback. The host plays the returned playlist URL with its own
@@ -189,6 +190,20 @@ public actor PrismCoreSession {
         /// without it — see the doc on the initializer before pairing this
         /// with a host-drawn overlay.
         public var preferredSubtitleLanguage: String?
+        /// Codecs this session must route through the audio bridge even
+        /// though they are in `HLSRemuxer`'s own hardcoded copyable set
+        /// (AC-3/E-AC-3, alongside AAC/FLAC/ALAC). That set assumes the
+        /// sink genuinely decodes the bitstream — true over real HDMI/
+        /// optical passthrough to a receiver, false on a device playing it
+        /// straight out of its own speaker or headphones (or a "TV" with no
+        /// passthrough-capable receiver in the chain), where the raw
+        /// bitstream comes out as noise instead of the downmix a decoded
+        /// PCM track would get. A host that knows its own sink doesn't
+        /// decode a codec the base set assumes it does forces it here
+        /// instead of forcing muxed shape or skipping this engine outright
+        /// — the video still stream-copies, only the audio takes the
+        /// (already-existing) bridge path DTS/TrueHD use.
+        public var forcedAudioBridgeCodecs: Set<AVCodecID>
         /// Clamped to ±2 s when the session is built, so a value read back here
         /// is the one in force, not the one asked for.
         public var audioDelaySeconds: Double
@@ -409,7 +424,8 @@ public actor PrismCoreSession {
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false,
         input: PrismCoreInputFactory? = nil,
-        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly
+        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly,
+        forcedAudioBridgeCodecs: Set<AVCodecID> = []
     ) throws {
         try self.init(
             url: url,
@@ -427,7 +443,8 @@ public actor PrismCoreSession {
             audioDelaySeconds: audioDelaySeconds,
             coordinatedHTTP: coordinatedHTTP,
             input: input,
-            reachability: reachability
+            reachability: reachability,
+            forcedAudioBridgeCodecs: forcedAudioBridgeCodecs
         )
     }
 
@@ -498,7 +515,8 @@ public actor PrismCoreSession {
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false,
         input: PrismCoreInputFactory? = nil,
-        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly
+        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly,
+        forcedAudioBridgeCodecs: Set<AVCodecID> = []
     ) throws {
         self.configuration = Options(
             sourceURL: url,
@@ -510,6 +528,7 @@ public actor PrismCoreSession {
             dialogueBoost: dialogueBoost,
             preferredAudioLanguage: preferredAudioLanguage,
             preferredSubtitleLanguage: preferredSubtitleLanguage,
+            forcedAudioBridgeCodecs: forcedAudioBridgeCodecs,
             audioDelaySeconds: AudioDelay.normalized(audioDelaySeconds),
             coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true,
             reachability: reachability
@@ -548,7 +567,8 @@ public actor PrismCoreSession {
             probed: probed,
             input: inputFactory,
             keyframeCacheDirectory: keyframeIndexCacheDirectory,
-            landed: landed
+            landed: landed,
+            forcedAudioBridgeCodecs: forcedAudioBridgeCodecs
         )
         self.remuxer = remuxer
         remuxer.audioDelaySeconds = AudioDelay.normalized(audioDelaySeconds)
@@ -596,7 +616,8 @@ public actor PrismCoreSession {
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false,
         input: PrismCoreInputFactory? = nil,
-        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly
+        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly,
+        forcedAudioBridgeCodecs: Set<AVCodecID> = []
     ) throws -> PrismCoreSession {
         try PrismCoreSession(
             url: url,
@@ -611,7 +632,8 @@ public actor PrismCoreSession {
             audioDelaySeconds: audioDelaySeconds,
             coordinatedHTTP: coordinatedHTTP,
             input: input,
-            reachability: reachability
+            reachability: reachability,
+            forcedAudioBridgeCodecs: forcedAudioBridgeCodecs
         )
     }
 
@@ -713,7 +735,14 @@ public actor PrismCoreSession {
             // easy to lose: a successor that fell back to `.loopbackOnly`
             // would serve 127.0.0.1 to an AirPlay receiver that cannot reach
             // it, and the rejection tier is exactly when that happens.
-            reachability: options.reachability
+            reachability: options.reachability,
+            // Carried, not re-derived: a master-rejection fallback that
+            // quietly dropped this would let AC-3/E-AC-3 (or whatever else
+            // the host excluded) fall back to a raw stream copy the host
+            // already determined its sink cannot take, in exactly the
+            // recovery path meant to keep the source's real quality without
+            // reintroducing the problem it was excluded for.
+            forcedAudioBridgeCodecs: options.forcedAudioBridgeCodecs
         )
         // A tripwire, not a doubt about today's initializer: the day someone
         // adds a work-directory parameter for a test or a cache, this is the

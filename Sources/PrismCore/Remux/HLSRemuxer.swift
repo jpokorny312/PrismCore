@@ -289,6 +289,12 @@ final class HLSRemuxer: @unchecked Sendable {
     /// answer to AVPlayer refusing a master (-11868/-11848/-1002): a fresh
     /// session with the one best audio track muxed into the variant.
     private let forceMuxed: Bool
+    /// Codecs the host has determined its sink cannot safely take as a raw
+    /// stream-copied bitstream (typically AC-3/E-AC-3 without a genuine
+    /// HDMI/optical passthrough receiver downstream) — routed through the
+    /// audio bridge instead, exactly like a codec `copyableAudio` never
+    /// covered at all. See `PrismCoreSession.Options.forcedAudioBridgeCodecs`.
+    private let forcedAudioBridgeCodecs: Set<AVCodecID>
     /// Dialogue-boost renditions to derive from the DEFAULT audio track, in
     /// the order requested. Empty (the default) produces nothing extra. Only
     /// the renditions shape can carry them — a boost lives in the master's
@@ -498,7 +504,8 @@ final class HLSRemuxer: @unchecked Sendable {
         input: PrismCoreInputFactory? = nil,
         keyframeCacheDirectory: URL? = nil,
         indexLoadBudget: Duration = SegmentPlan.indexLoadBudget,
-        landed: ProductionSignal? = nil
+        landed: ProductionSignal? = nil,
+        forcedAudioBridgeCodecs: Set<AVCodecID> = []
     ) {
         self.probed = probed
         // The probe's factory carries over when the caller did not pass one:
@@ -522,6 +529,7 @@ final class HLSRemuxer: @unchecked Sendable {
         self.dialogueBoost = dialogueBoost
         self.preferredAudioLanguage = preferredAudioLanguage
         self.preferredSubtitleLanguage = preferredSubtitleLanguage
+        self.forcedAudioBridgeCodecs = forcedAudioBridgeCodecs
     }
 
     func cancel() {
@@ -720,10 +728,17 @@ final class HLSRemuxer: @unchecked Sendable {
 
         let candidates = audioCandidates(input)
         let bestAudio = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, videoIndex, nil, 0)
+        // The host's exclusions win over the base set: a codec it named here
+        // is one its own sink cannot safely take raw, no matter how ordinary
+        // that codec looks to this engine's own defaults.
+        let isCopyable: (AVCodecID) -> Bool = { [forcedAudioBridgeCodecs] codecID in
+            Self.copyableAudio.contains(codecID) && !forcedAudioBridgeCodecs.contains(codecID)
+        }
         let routes = Self.routeAll(
             candidates: candidates,
             best: bestAudio >= 0 ? bestAudio : nil,
-            preferredLanguage: preferredAudioLanguage
+            preferredLanguage: preferredAudioLanguage,
+            isCopyable: isCopyable
         )
 
         // Can this source be honestly wrapped in a master playlist at all? The
@@ -771,7 +786,8 @@ final class HLSRemuxer: @unchecked Sendable {
             : .muxed(Self.chooseAudio(
                 candidates: candidates,
                 best: bestAudio >= 0 ? bestAudio : nil,
-                preferredLanguage: preferredAudioLanguage
+                preferredLanguage: preferredAudioLanguage,
+                isCopyable: isCopyable
             ))
 
         // Demand-driven mode needs a trustworthy upfront segmentation. Only a
@@ -1903,10 +1919,11 @@ final class HLSRemuxer: @unchecked Sendable {
         candidates: [AudioCandidate],
         best: Int32?,
         preferredLanguage: String? = nil,
-        canBridge: (AVCodecID) -> Bool = { AudioBridge.canBridge(codecID: $0) }
+        canBridge: (AVCodecID) -> Bool = { AudioBridge.canBridge(codecID: $0) },
+        isCopyable: (AVCodecID) -> Bool = { copyableAudio.contains($0) }
     ) -> [AudioRoute] {
         let viable: [AudioRoute] = candidates.compactMap { candidate in
-            if copyableAudio.contains(candidate.codecID) {
+            if isCopyable(candidate.codecID) {
                 return AudioRoute(index: candidate.index, mode: .streamCopy)
             }
             if canBridge(candidate.codecID) {
@@ -1918,7 +1935,8 @@ final class HLSRemuxer: @unchecked Sendable {
                   candidates: candidates,
                   best: best,
                   preferredLanguage: preferredLanguage,
-                  canBridge: canBridge
+                  canBridge: canBridge,
+                  isCopyable: isCopyable
               ),
               let position = viable.firstIndex(where: { $0.index == preferred.index })
         else { return viable }
@@ -2012,11 +2030,12 @@ final class HLSRemuxer: @unchecked Sendable {
         candidates: [AudioCandidate],
         best: Int32?,
         preferredLanguage: String? = nil,
-        canBridge: (AVCodecID) -> Bool = { AudioBridge.canBridge(codecID: $0) }
+        canBridge: (AVCodecID) -> Bool = { AudioBridge.canBridge(codecID: $0) },
+        isCopyable: (AVCodecID) -> Bool = { copyableAudio.contains($0) }
     ) -> AudioRoute? {
         /// How this track would be carried, or `nil` when it cannot be.
         func route(_ candidate: AudioCandidate) -> AudioRoute? {
-            if copyableAudio.contains(candidate.codecID) {
+            if isCopyable(candidate.codecID) {
                 return AudioRoute(index: candidate.index, mode: .streamCopy)
             }
             if canBridge(candidate.codecID) {
@@ -2046,7 +2065,7 @@ final class HLSRemuxer: @unchecked Sendable {
             return route
         }
         if let best, let bestCandidate = candidates.first(where: { $0.index == best }) {
-            if copyableAudio.contains(bestCandidate.codecID) {
+            if isCopyable(bestCandidate.codecID) {
                 return AudioRoute(index: best, mode: .streamCopy)
             }
             if canBridge(bestCandidate.codecID) {
@@ -2056,7 +2075,7 @@ final class HLSRemuxer: @unchecked Sendable {
         if let flagged = candidates.first(where: \.isDefault), let route = route(flagged) {
             return route
         }
-        if let copyable = candidates.first(where: { copyableAudio.contains($0.codecID) }) {
+        if let copyable = candidates.first(where: { isCopyable($0.codecID) }) {
             return AudioRoute(index: copyable.index, mode: .streamCopy)
         }
         if let bridgeable = candidates.first(where: { canBridge($0.codecID) }) {
