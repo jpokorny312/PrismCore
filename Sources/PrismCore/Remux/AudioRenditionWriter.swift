@@ -501,6 +501,42 @@ final class AudioRenditionWriter {
     /// the two stay tellable-apart in AVKit's own picker — and NAME must be
     /// unique within the group anyway.
     private var renditionName: String {
+        if let nameOverride { return nameOverride }
+        if let level = route.mode.dialogueBoostLevel {
+            return "\(baseRenditionName) (\(level.renditionNameSuffix))"
+        }
+        return baseRenditionName
+    }
+
+    /// The name the master actually declares once `uniqueRenditionNames` has
+    /// resolved collisions across the whole group; `nil` until then, in
+    /// which case the name derived from the track itself is used.
+    var nameOverride: String?
+
+    /// HLS requires every `#EXT-X-MEDIA` `NAME` to be unique within its
+    /// group, and AVPlayer discards the entire master ("duplicate name …
+    /// for rendition group") when two collide — which two untitled tracks
+    /// sharing a language always do, since each falls back to the same
+    /// localized language name. The first holder of a name keeps it
+    /// untouched; every later one gets a numeric suffix ("English",
+    /// "English 2", "English 3"). Comparison is case-insensitive, and a
+    /// generated name that would itself collide with a real one is bumped
+    /// further, so the result is always pairwise distinct.
+    static func uniqueRenditionNames(_ names: [String]) -> [String] {
+        var taken: Set<String> = []
+        return names.map { name in
+            var candidate = name
+            var suffix = 2
+            while !taken.insert(candidate.lowercased()).inserted {
+                candidate = "\(name) \(suffix)"
+                suffix += 1
+            }
+            return candidate
+        }
+    }
+
+    /// The name derived from the track alone, before collision handling.
+    var derivedRenditionName: String {
         if let level = route.mode.dialogueBoostLevel {
             return "\(baseRenditionName) (\(level.renditionNameSuffix))"
         }

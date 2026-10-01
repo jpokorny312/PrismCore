@@ -8,6 +8,16 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two audio tracks with the same name no longer make AVPlayer reject the
+  master.** Untitled tracks sharing a language were both declared with the
+  bare localized language name, violating HLS's per-group `NAME` uniqueness
+  rule (`#EXT-X-MEDIA: duplicate name … for rendition group "aud"`). The first
+  track keeps its name; later duplicates get a numeric suffix ("English",
+  "English 2"). Hosts that label tracks from their own metadata are
+  unaffected.
+
 ## [3.2.5] — 2026-09-30
 
 Keeps host cue-tap subtitles on the plan's timeline origin after an early

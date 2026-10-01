@@ -1105,6 +1105,15 @@ final class HLSRemuxer: @unchecked Sendable {
                         renditions.filter(\.isLazy).map(\.playlistURI)
                     )
                 }
+                // NAME must be unique within the group or AVPlayer rejects the
+                // whole master; two untitled tracks in one language would
+                // otherwise both be declared with the bare language name.
+                let uniqueNames = AudioRenditionWriter.uniqueRenditionNames(
+                    renditions.map(\.derivedRenditionName)
+                )
+                for (rendition, name) in zip(renditions, uniqueNames) {
+                    rendition.nameOverride = name
+                }
                 variant.audioRenditions = renditions.enumerated().map { ordinal, rendition in
                     // DEFAULT on the first rendition only, which is the track
                     // `chooseAudio` would have picked (see `routeAll`) — and
