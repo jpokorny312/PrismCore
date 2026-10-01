@@ -226,6 +226,65 @@ same file over a Range-capable server plans on the keyframe index. If a
 benchmark shows `basis=uniform` on a file that has Cues, suspect the server
 before the planner.
 
+### Reproducing with `prismcore-cli`
+
+A field report no longer needs a device build for the first questions.
+`swift run prismcore-cli <command> <url-or-path>` (macOS only):
+
+- `probe`: `SourceInfo`, the container structure (`--structure
+  none|layout|full`), the probe's phase timings, and the `decide` verdict
+  with its reason. A decline is a verdict, so it exits 0. Exit 2 means the
+  source could not be read at all.
+- `serve`: a remux session built the way a host builds one (probe → decide →
+  `PrismCoreSession(probed:)`). It prints the loopback playlist URL and runs
+  until Enter, Ctrl-C or `--for SECONDS`, then calls `stop()`. Open the URL
+  in Safari or QuickTime Player.
+- `bench`: `StartupCheckpointRun`, the **same code** the opt-in
+  `StartupCheckpointBenchmark` prints through, so a CLI line and a harness
+  line compare term by term. `--runs N` prints the spread.
+- `segverify`: fetches every served segment over HTTP, as a player would, and
+  decodes init + that one fragment with a fresh libavformat/libavcodec pair
+  (`SegmentVerifier`). It names each segment that does not open on a
+  keyframe, fails to demux or decode, is listed but not served, or loses
+  pictures. An open GOP's leading pictures and an `#EXTINF` far from the
+  media's length are warnings. `--hls` verifies an existing playlist
+  without remuxing, sending `-H` on every request (master, media playlists,
+  init, fragments). Byte-range segments (`EXT-X-BYTERANGE`, `EXT-X-MAP`
+  `BYTERANGE`) are fetched as ranges, each map applies to the segments after
+  it, and a playlist that has not ended is followed by **media sequence**,
+  not position — a sliding window re-indexed by position skips whatever
+  slid in. A check that could not be made — a stream this build has no
+  decoder for, a segment that left the window before it was fetched,
+  encrypted segments — is an `unverified` finding and **exit 69, never
+  `ok`**: nothing was found wrong, and nothing was shown right.
+- `validate`: serves, then runs Apple's `mediastreamvalidator` in `--out
+  DIR`, and `hlsreport` over its JSON when that tool is present too. **Opt-in
+  on Apple's HTTP Live Streaming Tools**, which CI and most machines do not
+  have: the tools come from `PATH` or `$PRISMCORE_MEDIASTREAMVALIDATOR` /
+  `$PRISMCORE_HLSREPORT`, and a missing validator prints a notice and exits 0.
+  `--require-validator` turns that into exit 69. The hermetic suite never
+  runs it.
+
+Ctrl-C / SIGTERM reach every phase, the probe and `start()` included —
+neither observes task cancellation, so each is raced against the stop
+(`untilStopped`) and the session is stopped under a `start()` that lost.
+An interrupt exits 130, except `serve` once its URL is printed, where
+Ctrl-C is the intended end and exits 0.
+
+The shared options are `-H "Name: value"` (repeatable), `--coordinated-http`,
+`--budget SECONDS` and `--display sdr|hdr|dv`, and `-v` turns on libav*
+warnings and engine notices. Everything in *Measuring* applies unchanged:
+point it at an **HTTP** origin, and at `Scripts/proxy-model-server.py` when
+the question is what the integrating host's range proxy costs.
+
+**What the CLI cannot tell you.** It runs on a Mac. libavcodec judges the
+segments and a loopback server serves them, and neither of those is a tvOS
+player or a TV. The tvOS display
+handshake (criteria, settle, `-11868` on an SDR-parked panel), Dolby Vision
+presentation on a real panel, and Atmos passthrough to a receiver are still
+decided only on the device. A clean `segverify` / `validate` makes those
+runs shorter. It does not replace them.
+
 ---
 
 ## Testing
@@ -241,6 +300,8 @@ before the planner.
   - `PRISMCORE_MEDIA` — real-media probe/DV verification
   - `PRISMCORE_PGS_MEDIA` — the OCR subtitle pipeline (no FFmpeg build can
     *encode* PGS, so there is no committable fixture)
+  - `PRISMCORE_HDR10PLUS_MEDIA` — the HDR10+ scout on a real encode (the
+    fixtures' SEI is script-injected; see `generate_hdr10plus.sh`)
   - `PRISMCORE_BENCH` — startup cost
 - Fixtures are synthetic (`testsrc2` + `sine`), generated with system `ffmpeg`
   and committed under `Tests/PrismCoreTests/Fixtures/`. They prove the
@@ -250,7 +311,8 @@ before the planner.
 ### Fuzzing
 
 Every hand-written bitstream parser (JOC walk, `dec3`, HEVC NAL framing,
-`hvcC` normalization, ISO-BMFF splice, text subtitles) is wired into
+`hvcC` normalization, ISO-BMFF splice, text subtitles, A/53 captions, the
+HDR10+ T.35 walk) is wired into
 `FuzzTargets` (`Sources/PrismCore/Fuzz/`) — uniform `bytes in → invariants
 checked` entry points, `package` access so the test target and the fuzzer
 executable share them. A target checks *wrong-answer* invariants, not just
@@ -315,6 +377,9 @@ Sources/PrismCore/
   Subtitles/                 WebVTT renditions, bitmap decode + OCR
   Display/                   tvOS criteria + settle
   Software/                  the decode-and-render path
+  Diagnostics/               package-only: StartupCheckpointRun, SegmentVerifier
+                             (shared by the CLI and the tests)
+Sources/prismcore-cli/       macOS repro tool: probe, serve, validate, bench, segverify
 Tests/PrismCoreTests/        Swift Testing, fixtures, opt-in harnesses
 ```
 

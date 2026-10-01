@@ -244,6 +244,41 @@ struct SubtitleRenditionTests {
         #expect(cues.last?.text.contains("Konec") == true)
     }
 
+    @Test("A re-anchor before the first keyframe keeps cues on the plan's origin, not the anchor's")
+    func cueTapOriginSurvivesEarlyReanchor() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PrismCoreEarlyAnchor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // The resume race, made deterministic: the anchor request is queued
+        // before `run()` reads a single packet, so the producer re-anchors to
+        // the last planned segment (keyframes every 2 s → entries at 0/2/4/6)
+        // without ever seeing the head keyframe. 3.2.4 took the anchor's
+        // keyframe (6 s) for the presentation origin and delivered "Konec"
+        // (7.0–7.9 s) at 1.0 s — in the past, so the host overlay never drew it.
+        let demand = DemandCoordinator()
+        let remuxer = HLSRemuxer(
+            sourceURL: try fixture("h264_aac_srt.mkv"),
+            outputDirectory: directory,
+            segmentSeconds: 2,
+            demand: demand
+        )
+        let collector = CueCollector()
+        remuxer.subtitles.setCueHandler { collector.append($0) }
+        demand.requestProduction(of: 3)
+        let producer = ProducerThread(name: "prismcore.tests.early-anchor") { try remuxer.run() }
+        defer { remuxer.cancel(); Task { await producer.join() } }
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(20))
+        while ContinuousClock.now < deadline, !collector.cues.contains(where: { $0.text.contains("Konec") }) {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let last = try #require(collector.cues.first { $0.text.contains("Konec") })
+        #expect(abs(last.start - 7.0) < 0.001)
+        #expect(abs(last.end - 7.9) < 0.001)
+    }
+
     // MARK: - Master playlist rules
 
     @Test("Renditions are never DEFAULT or AUTOSELECT — the host selects them")

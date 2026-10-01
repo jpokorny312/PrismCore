@@ -15,6 +15,15 @@ startup that takes 18 s on a device benchmarks at 60 ms here.
 CHUNK_BYTES is the proxy's forwarded window (8 MB is Aether's), RATE_BPS the
 origin's throughput behind it, RTT_MS one round trip, REQLOG a file to record
 each request in — the count is the number that matters.
+
+VALIDATOR=1 adds an ETag (from the file's size and mtime) to every response.
+Off by default, because the proxy it models forwards none — and without one
+`PrismCoreEngine.prewarm` refuses to store anything. On, it models a proxy
+that passes its origin's validator through, which is what a prewarm needs:
+
+    VALIDATOR=1 python3 Scripts/proxy-model-server.py movie.mkv 8732
+    PRISMCORE_BENCH=http://127.0.0.1:8732/movie.mkv PRISMCORE_BENCH_COORDINATED_HTTP=1 \
+        PRISMCORE_BENCH_PREWARM=1 swift test --filter checkpointLine
 """
 
 import os, re, sys, time, threading
@@ -30,6 +39,9 @@ RATE  = float(os.environ.get("RATE_BPS", 800_000))   # origin bytes/second
 RTT   = float(os.environ.get("RTT_MS", "40")) / 1000.0
 LOG   = os.environ.get("REQLOG", "/dev/null")
 SIZE  = os.path.getsize(PATH)
+# Nanosecond mtime, not seconds: an ETag with one-second resolution has the
+# same blind spot as Last-Modified, which the prewarm refuses to trust.
+ETAG  = ('"%x-%x"' % (SIZE, os.stat(PATH).st_mtime_ns)) if os.environ.get("VALIDATOR") == "1" else None
 lock  = threading.Lock()
 
 class H(BaseHTTPRequestHandler):
@@ -62,6 +74,7 @@ class H(BaseHTTPRequestHandler):
         if head:
             time.sleep(RTT)
             self.send_response(200); self.send_header("Content-Length", str(SIZE))
+            if ETAG: self.send_header("ETag", ETAG)
             self.send_header("Accept-Ranges", "bytes"); self.end_headers(); return
         # The proxy's first bite: downloaded in full before anything is written out.
         bite = min(length, CHUNK)
@@ -72,6 +85,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(length))
+        if ETAG: self.send_header("ETag", ETAG)
         if partial:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, SIZE))
         self.end_headers()

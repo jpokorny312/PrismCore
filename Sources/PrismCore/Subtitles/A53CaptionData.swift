@@ -37,17 +37,6 @@ enum A53CaptionData {
         }
     }
 
-    /// `nal_unit_type` values that carry SEI messages.
-    private static func isSEI(_ type: UInt8, codec: HEVCNALUnits.Codec) -> Bool {
-        switch codec {
-        case .h264: return type == 6
-        // Prefix (39) and suffix (40) SEI both legally carry user data; A/53
-        // uses the prefix one, but reading both costs nothing and a suffix
-        // message is not malformed.
-        case .hevc: return type == 39 || type == 40
-        }
-    }
-
     /// Every caption triplet in one compressed video packet.
     ///
     /// Returns an empty array — the overwhelmingly common answer — without
@@ -62,7 +51,7 @@ enum A53CaptionData {
     ) -> [Triplet] {
         var found: [Triplet] = []
         HEVCNALUnits.scan(bytes, framing: framing, codec: codec) { type, payload in
-            guard isSEI(type, codec: codec) else { return }
+            guard HEVCNALUnits.isSEI(type, codec: codec) else { return }
             appendTriplets(fromSEINAL: payload, into: &found)
         }
         return found
@@ -72,36 +61,9 @@ enum A53CaptionData {
     static func appendTriplets(
         fromSEINAL payload: UnsafeBufferPointer<UInt8>, into found: inout [Triplet]
     ) {
-        // Emulation prevention has to come off before the message loop reads
-        // sizes: a `00 00 03` inside a caption byte pair would otherwise be
-        // counted as three payload bytes and shift every field after it.
-        let rbsp = unescaped(payload)
-        var cursor = 0
-
-        func readExtended() -> Int? {
-            var value = 0
-            while cursor < rbsp.count {
-                let byte = rbsp[cursor]
-                cursor += 1
-                value += Int(byte)
-                if byte != 0xFF { return value }
-                // A run of 0xFF that never terminates is a malformed message,
-                // and the sum would otherwise grow past the buffer silently.
-                if value > rbsp.count { return nil }
-            }
-            return nil
-        }
-
-        while cursor < rbsp.count {
-            // `rbsp_trailing_bits`: the stop bit ends the message loop.
-            if rbsp[cursor] == 0x80 { return }
-            guard let payloadType = readExtended(), let payloadSize = readExtended(),
-                  cursor + payloadSize <= rbsp.count
-            else { return }
-            let message = rbsp[cursor..<(cursor + payloadSize)]
-            cursor += payloadSize
-            // 4 = user_data_registered_itu_t_t35.
-            if payloadType == 4 { appendTriplets(fromT35: message, into: &found) }
+        HEVCNALUnits.forEachSEIMessage(inSEINAL: payload) { payloadType, message in
+            if payloadType == HEVCNALUnits.t35PayloadType { appendTriplets(fromT35: message, into: &found) }
+            return true
         }
     }
 
@@ -133,22 +95,5 @@ enum A53CaptionData {
                 )
             )
         }
-    }
-
-    /// Remove `emulation_prevention_three_byte`: every `00 00 03` becomes
-    /// `00 00`.
-    static func unescaped(_ payload: UnsafeBufferPointer<UInt8>) -> [UInt8] {
-        var output: [UInt8] = []
-        output.reserveCapacity(payload.count)
-        var zeroRun = 0
-        for byte in payload {
-            if zeroRun >= 2 && byte == 0x03 {
-                zeroRun = 0
-                continue
-            }
-            zeroRun = byte == 0 ? zeroRun + 1 : 0
-            output.append(byte)
-        }
-        return output
     }
 }

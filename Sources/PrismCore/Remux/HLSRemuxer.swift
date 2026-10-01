@@ -702,6 +702,21 @@ final class HLSRemuxer: @unchecked Sendable {
                codecID: input.pointee.streams[Int(videoIndex)]!.pointee.codecpar.pointee.codec_id,
                nalUnitLengthSize: videoTrack.nalUnitLengthSize
            ) {
+            // A host that opted into the HDR10+ scan hands over a context the
+            // scan has already walked — up to its whole budget, or to EOF on a
+            // short source. Scouting captions from there looks at the wrong
+            // stretch of the file (or at nothing), and a service found missing
+            // here is missing from the master for the whole session: with the
+            // scan on, a file captioned on every picture came up with no CC1.
+            // So this one case pays its rewind BEFORE the scout rather than
+            // after it — one extra seek (a Range request over HTTP), charged
+            // only to hosts that asked for the scan. The interlace
+            // verification's dozen frames are not rewound here: that is the
+            // window captions have always been scouted from.
+            if adoptedInfo?.hdr10Plus?.consumedPackets == true {
+                _ = av_seek_frame(input, -1, 0, AVSEEK_FLAG_BACKWARD)
+                avformat_flush(input)
+            }
             closedCaptions = ClosedCaptionScout.scan(
                 input: input, videoStreamIndex: videoIndex,
                 framing: carriage.framing, codec: carriage.codec
@@ -1183,6 +1198,15 @@ final class HLSRemuxer: @unchecked Sendable {
         // (the packet still carries it when the cut decision is made).
         let videoTimeBase = input.pointee.streams[Int(videoIndex)]!.pointee.time_base
         let tickSeconds = av_q2d(videoTimeBase)
+        // Planned mode knows the presentation origin before the first packet:
+        // the plan's head entry, the keyframe the playlist's segment 0 opens
+        // on. Waiting for the first keyframe seen (the sequential path below)
+        // is wrong here — a resume seek can re-anchor the producer before the
+        // head is ever read, and the anchor's keyframe would become the origin,
+        // putting every host cue in the past by the anchor time.
+        if let head = plannedPlan?.entries.first {
+            subtitles.setTimelineOrigin(seconds: Double(head.startPTS) * tickSeconds)
+        }
         let boundaryStep = Int64((Double(segmentSeconds) / tickSeconds).rounded())
         // Sequential (EVENT) sessions have no plan to read the short head
         // from, so the first boundary is computed here: the same shorter
@@ -1617,6 +1641,9 @@ final class HLSRemuxer: @unchecked Sendable {
                                     : pts + (segmentIndex == 0 ? firstBoundaryStep : boundaryStep)
                                 // The presentation origin: what the WebVTT timestamp
                                 // maps are anchored to (see WebVTTRenditionWriter).
+                                // Sequential mode only in effect: planned mode set
+                                // it from the plan's head before the loop, and the
+                                // origin is set once.
                                 subtitles.setTimelineOrigin(seconds: Double(pts) * tickSeconds)
                             } else if pts >= nextBoundaryPTS {
                                 try emitSegment(endPTS: pts)

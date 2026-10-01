@@ -158,6 +158,9 @@ final class ReadInterruptGuard: @unchecked Sendable {
     /// moved it off the reader's default block.
     var hintedFirstReadBytes: Int? { httpInput?.firstFillBytes }
 
+    /// What the coordinated reader did with a prewarm of this source.
+    var prewarmUse: SourcePrewarmUse { httpInput?.prewarmUse ?? .none }
+
     /// Start enforcing: reads abort (`AVERROR_EXIT`) once `budget` has passed.
     func arm(budget: Duration) {
         let expiry = ContinuousClock.now + budget

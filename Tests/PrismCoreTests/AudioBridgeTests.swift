@@ -1,5 +1,6 @@
 import Testing
 import Libavcodec
+import Libavformat
 @testable import PrismCore
 
 /// The bridge's two pure pieces. Everything that touches libavcodec state needs
@@ -531,5 +532,69 @@ struct AudioBridgePipelineTests {
         let span = timestamps.last! - timestamps.first!
         #expect(span > 5 * Int64(Self.sampleRate), "the gap must move the timeline")
         #expect(timestamps.count < 20, "no silence was invented to cover the gap")
+    }
+
+    // MARK: - AAC layout negotiation (#104)
+
+    /// The AudioSpecificConfig's 4-bit channelConfiguration, read from the
+    /// extradata `configure(outputStream:)` hands the muxer. 0 means "see the
+    /// Program Config Element" — the form AVPlayer silently refuses.
+    private func aacChannelConfiguration(of bridge: AudioBridge) throws -> Int {
+        let format = try #require(avformat_alloc_context())
+        defer { var format: UnsafeMutablePointer<AVFormatContext>? = format; avformat_free_context(format) }
+        let stream = try #require(avformat_new_stream(format, nil))
+        try bridge.configure(outputStream: stream)
+        let par = stream.pointee.codecpar!
+        let extradata = try #require(par.pointee.extradata, "aac with a global header carries its ASC in extradata")
+        try #require(par.pointee.extradata_size >= 2)
+        // objectType:5 samplingFrequencyIndex:4 channelConfiguration:4 — the
+        // index is never the explicit-rate escape (15) at 48 kHz.
+        return Int((extradata[1] >> 3) & 0x0F)
+    }
+
+    private func makeAACBridge(layout: String) throws -> AudioBridge? {
+        guard avcodec_find_encoder(AV_CODEC_ID_AAC) != nil else { return nil }
+        let par = avcodec_parameters_alloc()!
+        defer { var par: UnsafeMutablePointer<AVCodecParameters>? = par; avcodec_parameters_free(&par) }
+        par.pointee.codec_type = AVMEDIA_TYPE_AUDIO
+        par.pointee.codec_id = AV_CODEC_ID_PCM_S16LE
+        par.pointee.format = AV_SAMPLE_FMT_S16.rawValue
+        par.pointee.sample_rate = Self.sampleRate
+        par.pointee.bits_per_coded_sample = 16
+        try FFmpegError.check(
+            av_channel_layout_from_string(&par.pointee.ch_layout, layout),
+            "av_channel_layout_from_string(\(layout))"
+        )
+        par.pointee.block_align = par.pointee.ch_layout.nb_channels * 2
+        return try AudioBridge(
+            codecpar: par,
+            timeBase: AVRational(num: 1, den: Self.sampleRate),
+            globalHeader: true,
+            targetCodec: AV_CODEC_ID_AAC
+        )
+    }
+
+    @Test("A 5.1(side) source reaches aac as a standard layout, not a PCE")
+    func aacSideSurroundAvoidsPCE() throws {
+        guard let bridge = try makeAACBridge(layout: "5.1(side)") else { return }
+        defer { bridge.close() }
+        #expect(bridge.outputChannelCount == 6)
+        #expect(try aacChannelConfiguration(of: bridge) == 6)
+    }
+
+    @Test("A 7.1 source is capped at 5.1 for aac rather than signalled by PCE")
+    func aacSevenOneCapsAtFiveOne() throws {
+        guard let bridge = try makeAACBridge(layout: "7.1") else { return }
+        defer { bridge.close() }
+        #expect(bridge.outputChannelCount == 6)
+        #expect(try aacChannelConfiguration(of: bridge) == 6)
+    }
+
+    @Test("Stereo stays stereo through the aac standardization")
+    func aacStereoUnchanged() throws {
+        guard let bridge = try makeAACBridge(layout: "stereo") else { return }
+        defer { bridge.close() }
+        #expect(bridge.outputChannelCount == 2)
+        #expect(try aacChannelConfiguration(of: bridge) == 2)
     }
 }

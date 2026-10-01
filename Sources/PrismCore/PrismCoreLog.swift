@@ -14,7 +14,7 @@ import os
 /// Reserved for the handful of moments a host cannot otherwise see: a
 /// capability the input does NOT have, and a teardown that had to give up on a
 /// thread. Everything routine belongs in the return values.
-enum PrismCoreLog {
+package enum PrismCoreLog {
 
     static let subsystem = "cz.zmrhal.prismcore"
 
@@ -23,13 +23,13 @@ enum PrismCoreLog {
     private static let observerLock = NSLock()
     nonisolated(unsafe) private static var storedObserver: (@Sendable (String) -> Void)?
 
-    /// A second destination for notices, for tests only.
+    /// A second destination for notices: tests, and `prismcore-cli --verbose`.
     ///
     /// The messages worth logging here mark a *path* — the engine noticing it
     /// cannot interrupt this input, `stop()` deciding to detach — and a path a
     /// test cannot observe is a path that silently stops being taken. The
     /// unified log cannot be read back in-process, so the test reads here.
-    static var observer: (@Sendable (String) -> Void)? {
+    package static var observer: (@Sendable (String) -> Void)? {
         get { observerLock.withLock { storedObserver } }
         set { observerLock.withLock { storedObserver = newValue } }
     }

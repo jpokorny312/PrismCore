@@ -9,7 +9,7 @@ final class HTTPRangeInput {
     private var url: URL
     private var headers: [String: String]
     private let interrupted: () -> Bool
-    private static let blockSize = 1 << 20
+    static let blockSize = 1 << 20
     private var position: Int64 = 0
     private var length: Int64?
     private var validator: String?
@@ -73,7 +73,7 @@ final class HTTPRangeInput {
     /// were fetched around. The bound is per reader, and a session has more
     /// than one (the producer, a scrub preview), so it is deliberately close
     /// to the read pattern's own size rather than a cache anyone would tune.
-    private static let retainedBytes = 4 << 20
+    static let retainedBytes = 4 << 20
     private var blocks: [(start: Int64, data: Data)] = []
     private var io: UnsafeMutablePointer<AVIOContext>?
     /// What the origin last said, kept because the only thing this reader can
@@ -89,12 +89,22 @@ final class HTTPRangeInput {
     var lastOriginFailure: PrismCoreError? { failureLock.withLock { latchedFailure } }
     private func latch(_ failure: PrismCoreError?) { failureLock.withLock { latchedFailure = failure } }
 
+    /// Where a prewarm left this source's first bytes, and what became of
+    /// them. Consulted once, before the first fill; `nil` opts a reader out
+    /// (tests that count requests against a cold origin).
+    private let prewarmStore: SourcePrewarmStore?
+    private var prewarmConsulted = false
+    private var prewarmOutcome: SourcePrewarmUse = .none
+    var prewarmUse: SourcePrewarmUse { failureLock.withLock { prewarmOutcome } }
+
     init(
         url: URL,
         headers: [String: String],
         hints: SourceOpenHints? = nil,
+        prewarmStore: SourcePrewarmStore? = .shared,
         interrupted: @escaping () -> Bool
     ) {
+        self.prewarmStore = prewarmStore
         self.url = url
         self.headers = headers
         self.interrupted = interrupted
@@ -134,6 +144,7 @@ final class HTTPRangeInput {
 
     private func seek(offset: Int64, whence: Int32) -> Int64 {
         if whence & 0x10000 != 0 { // AVSEEK_SIZE
+            if length == nil { adoptPrewarmIfPresent() }
             if length == nil { do { try fill() } catch { return -1 } }
             return length ?? -1
         }
@@ -155,6 +166,7 @@ final class HTTPRangeInput {
         if interrupted() { return swift_AVERROR_EXIT() }
         if let length, position >= length { return swift_AVERROR_EOF() }
         do {
+            if blockIndex(containing: position) == nil { adoptPrewarmIfPresent() }
             if blockIndex(containing: position) == nil { try fill() }
             guard let index = blockIndex(containing: position) else { return swift_AVERROR_EOF() }
             // Touched blocks become the most recent, so a reader alternating
@@ -250,9 +262,7 @@ final class HTTPRangeInput {
                   range.end - range.start + 1 == Int64(response.data.count),
                   response.data.count <= requestSize else { throw Failure.request }
             if let length, length != range.total { throw Failure.request }
-            let tag = response.response?.value(forHTTPHeaderField: "ETag")
-            let currentValidator = tag.flatMap { $0.hasPrefix("W/") ? nil : $0 }
-                ?? response.response?.value(forHTTPHeaderField: "Last-Modified")
+            let currentValidator = Self.validator(of: response.response)
             if let validator, let currentValidator, validator != currentValidator { throw Failure.request }
             if validator == nil { validator = currentValidator }
             // The caller's expectation, judged once and only on the FIRST real
@@ -263,18 +273,7 @@ final class HTTPRangeInput {
             // open unhinted. The mid-session case is the line above, which
             // does throw, because there the old version's headers, blocks and
             // plan are already built and mixing versions fails invisibly.
-            if !firstResponseSeen {
-                firstResponseSeen = true
-                let verdict: ValidatorObservation
-                switch (expectedValidator, currentValidator) {
-                case (nil, let reported?): verdict = .unchecked(reported)
-                case (nil, nil): verdict = .unavailable
-                case (_?, nil): verdict = .unavailable
-                case (let expected?, let reported?):
-                    verdict = expected == reported ? .satisfied(reported) : .mismatched(reported: reported)
-                }
-                failureLock.withLock { observation = verdict }
-            }
+            observeFirstResponse(reporting: currentValidator)
             // One fill only: every later read is an ordinary block.
             if firstFillSize != nil {
                 firstFillBytes = requestSize
@@ -297,6 +296,135 @@ final class HTTPRangeInput {
         throw Failure.request
     }
 
+    /// The validator a response binds its bytes to: a strong `ETag`, else
+    /// `Last-Modified`. A weak `ETag` promises semantic equivalence, not the
+    /// same bytes, and byte ranges from two "equivalent" versions do not make
+    /// one file.
+    static func validator(of response: HTTPURLResponse?) -> String? {
+        strongETag(of: response) ?? response?.value(forHTTPHeaderField: "Last-Modified")
+    }
+
+    /// The strong `ETag` alone — the only validator a prewarm binds bytes to.
+    ///
+    /// `Last-Modified` is enough for `If-Range` on a live read, where the
+    /// bytes arrive in the same response the date came with. It is not
+    /// enough to vouch for bytes fetched minutes earlier: it has one-second
+    /// resolution, so a file replaced within the second it was last written
+    /// keeps its date, and when the length and the first byte survive too
+    /// (a re-mux, a re-tag) every check the adoption makes passes on stale
+    /// bytes.
+    static func strongETag(of response: HTTPURLResponse?) -> String? {
+        response?.value(forHTTPHeaderField: "ETag").flatMap { $0.hasPrefix("W/") ? nil : $0 }
+    }
+
+    private func observeFirstResponse(reporting currentValidator: String?) {
+        guard !firstResponseSeen else { return }
+        firstResponseSeen = true
+        let verdict: ValidatorObservation
+        switch (expectedValidator, currentValidator) {
+        case (nil, let reported?): verdict = .unchecked(reported)
+        case (nil, nil): verdict = .unavailable
+        case (_?, nil): verdict = .unavailable
+        case (let expected?, let reported?):
+            verdict = expected == reported ? .satisfied(reported) : .mismatched(reported: reported)
+        }
+        failureLock.withLock { observation = verdict }
+    }
+
+    /// Take over a prewarm of this URL and these headers — once, before
+    /// anything has been fetched, and only after the origin has confirmed it
+    /// still serves the bytes the prewarm saw.
+    ///
+    /// The confirmation is one request for one byte. It is the same trust
+    /// rule the 3.2.0 hints follow, applied where the stakes are higher: a
+    /// stale sizing hint costs a read, stale *bytes* are a wrong parse. So
+    /// the strong ETag and the length must both match, and the one byte must
+    /// be the byte the prewarm stored at that offset. Against a host proxy
+    /// that fetches each window whole, a one-byte window is a round trip and
+    /// nothing more, which is the whole saving: the reads it replaces are a
+    /// full bite each.
+    ///
+    /// Every way this can fail is "read the network, as if nobody had
+    /// prewarmed" — never a failed open. A mismatch discards the entry (it
+    /// describes a representation the origin no longer serves); an answer
+    /// that did not arrive leaves it for a later reader.
+    private func adoptPrewarmIfPresent() {
+        guard !prewarmConsulted else { return }
+        prewarmConsulted = true
+        guard let store = prewarmStore, blocks.isEmpty, length == nil else { return }
+        let key = SourcePrewarmStore.Key(url: url, headers: headers)
+        guard let entry = store.entry(for: key) else { return }
+        autoreleasepool {
+            let deadline = ProcessInfo.processInfo.systemUptime + 15
+            let cancelled = { [self] in interrupted() || ProcessInfo.processInfo.systemUptime >= deadline }
+            let origin = HTTPOriginCoordinator.origin(url)
+            // Full-priority admission: this request is on the path of a play
+            // the user is waiting for, unlike the prewarm that filled the
+            // entry.
+            guard HTTPOriginCoordinator.shared.acquire(origin, cancelled: cancelled) else {
+                failureLock.withLock { prewarmOutcome = .unverified }
+                return
+            }
+            let response = try? RangeResponse.fetch(url: url, headers: headers, start: 0, size: 1,
+                                                    cancelled: cancelled)
+            let status = response?.response?.statusCode ?? 0
+            if [429, 503, 509].contains(status) {
+                // Recorded so the fill that follows waits the refusal out
+                // rather than walking straight into it.
+                HTTPOriginCoordinator.shared.refuse(
+                    origin, retryAfter: response?.response?.value(forHTTPHeaderField: "Retry-After"))
+            }
+            HTTPOriginCoordinator.shared.release(origin)
+            guard let response, status == 206, response.error == nil,
+                  let raw = response.response?.value(forHTTPHeaderField: "Content-Range"),
+                  let range = Self.contentRange(raw), range.start == 0, response.data.count == 1
+            else {
+                failureLock.withLock { prewarmOutcome = .unverified }
+                return
+            }
+            let reported = Self.validator(of: response.response)
+            // This is the first response this reader has seen, whatever
+            // happens next, and the hints' validator check is judged on it.
+            observeFirstResponse(reporting: reported)
+            validator = reported
+            length = range.total
+            // Judged on the strong ETag only, whatever the entry says: an
+            // origin that has since dropped its ETag in favour of a date can
+            // no longer vouch for these bytes (see `strongETag(of:)`).
+            guard let tag = Self.strongETag(of: response.response), tag == entry.validator,
+                  range.total == entry.length,
+                  let head = entry.blocks.first, head.start == 0, head.data.first == response.data.first
+            else {
+                store.remove(key)
+                failureLock.withLock { prewarmOutcome = .stale }
+                return
+            }
+            // Head first: it is the region read first and read again after
+            // the excursion to the tail, so it is the one retention keeps if
+            // an entry ever outgrows it.
+            //
+            // Split to block size on the way in, so the reader's own eviction
+            // drops a block at a time as it does for fetched ones — an entry
+            // taken as one large block is lost whole to the first fill that
+            // needs room, header included.
+            var taken = 0
+            for block in entry.blocks where taken + block.data.count <= Self.retainedBytes {
+                var offset = 0
+                while offset < block.data.count {
+                    let end = min(offset + Self.blockSize, block.data.count)
+                    let piece = block.data.startIndex + offset..<block.data.startIndex + end
+                    blocks.append((start: block.start + Int64(offset), data: Data(block.data[piece])))
+                    offset = end
+                }
+                taken += block.data.count
+            }
+            // The region a sizing hint would have sized is already here; the
+            // next fill is an ordinary block past it.
+            firstFillSize = nil
+            failureLock.withLock { prewarmOutcome = .adopted(bytes: taken) }
+        }
+    }
+
     private func blockIndex(containing offset: Int64) -> Int? {
         blocks.lastIndex { offset >= $0.start && offset < $0.start + Int64($0.data.count) }
     }
@@ -312,7 +440,7 @@ final class HTTPRangeInput {
     enum Failure: Error { case allocation, request }
 }
 
-private final class RangeResponse: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+final class RangeResponse: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     var response: HTTPURLResponse?
     var data = Data()
     var error: Error?

@@ -23,7 +23,66 @@ package enum FuzzSeeds {
         ],
         "a53-captions": [captionedAccessUnit, xdsAccessUnit],
         "container-layout": [matroskaHead, faststartMP4Head],
+        "hdr10plus-sei": [hdr10PlusAccessUnit(annexB: false), hdr10PlusAccessUnit(annexB: true)],
     ]
+
+    /// A complete ST 2094-40 `user_data_registered_itu_t_t35` payload: one
+    /// window, nine percentiles, a tone-mapping curve — the bytes
+    /// `Tests/…/Fixtures/inject_hdr10plus_sei.py` writes, which FFmpeg's own
+    /// decoder reads back as HDR10+ side data.
+    package static let hdr10PlusT35Payload: [UInt8] = [
+        0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04, 0x01, 0x40, 0x00, 0x0C, 0x81, 0x38, 0x80, 0x94, 0x70, 0x46,
+        0x50, 0x0B, 0xB8, 0x24, 0x08, 0x01, 0x90, 0x28, 0x0E, 0x10, 0x50, 0x1F, 0x40, 0xC8, 0x4E, 0x21,
+        0x90, 0x9C, 0x42, 0x59, 0x38, 0x82, 0xD1, 0xD4, 0xC2, 0xFA, 0x22, 0xE3, 0x1A, 0x61, 0x60, 0x00,
+        0x60, 0x02, 0x00, 0x24, 0x66, 0x33, 0x53, 0x36, 0x6A, 0x00, 0x99, 0xAC, 0xDC, 0xCF, 0x9A, 0x00,
+    ]
+
+    /// An HEVC access unit shaped like an encoder's: a prefix SEI NAL whose
+    /// message loop holds a `structure_of_pictures_info`, a message of an
+    /// extended (two-byte) payload type, an unregistered encoder banner, an
+    /// A/53 caption T.35 message and then the HDR10+ one, followed by a slice.
+    ///
+    /// The decoys are the point. Payload type 128 opens with the same `0x80`
+    /// byte as `rbsp_trailing_bits`, and type 260 (`FF 05`) is a type number
+    /// larger than the whole message — each once ended the loop before HDR10+.
+    /// The banner makes the loop step over a message it does not want, and the
+    /// caption message shares the payload type AND the country code with
+    /// HDR10+ — so a mutation that blurs the terminal-provider test lands on a
+    /// branch that tells the two apart.
+    package static func hdr10PlusAccessUnit(annexB: Bool) -> [UInt8] {
+        // SPS 0, one IDR picture (nal_unit_type 19), temporal id 0.
+        let structureOfPictures: [UInt8] = [0xD3, 0x10]
+        let extendedType: [UInt8] = [0xAA, 0xBB]
+        let banner: [UInt8] = [UInt8](repeating: 0x2C, count: 16) + Array("x265".utf8)
+        let caption: [UInt8] = [0xB5, 0x00, 0x31, 0x47, 0x41, 0x39, 0x34, 0x03, 0x40, 0xFF]
+        let rbsp: [UInt8] = [0x80, UInt8(structureOfPictures.count)] + structureOfPictures
+            + [0xFF, 0x05, UInt8(extendedType.count)] + extendedType
+            + [0x05, UInt8(banner.count)] + banner
+            + [0x04, UInt8(caption.count)] + caption
+            + [0x04, UInt8(hdr10PlusT35Payload.count)] + hdr10PlusT35Payload
+            + [0x80]
+        var escaped: [UInt8] = []
+        var zeroRun = 0
+        for byte in rbsp {
+            if zeroRun >= 2 && byte <= 0x03 {
+                escaped.append(0x03)
+                zeroRun = 0
+            }
+            zeroRun = byte == 0 ? zeroRun + 1 : 0
+            escaped.append(byte)
+        }
+        let sei: [UInt8] = [39 << 1, 0x01] + escaped
+        let slice: [UInt8] = [0x02, 0x01, 0xAF, 0x09, 0x40, 0x5A]
+        if annexB {
+            return [0x00, 0x00, 0x00, 0x01] + sei + [0x00, 0x00, 0x01] + slice
+        }
+        func prefixed(_ unit: [UInt8]) -> [UInt8] {
+            let count = unit.count
+            return [UInt8((count >> 24) & 0xFF), UInt8((count >> 16) & 0xFF),
+                    UInt8((count >> 8) & 0xFF), UInt8(count & 0xFF)] + unit
+        }
+        return prefixed(sei) + prefixed(slice)
+    }
 
     /// The head of a Matroska laid out the way mkvmerge writes one: EBML
     /// header, Segment, a SeekHead pointing at Cues past the media, Tracks,

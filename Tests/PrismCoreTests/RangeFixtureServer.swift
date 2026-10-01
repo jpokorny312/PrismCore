@@ -6,7 +6,7 @@ import Network
 final class RangeFixtureServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "prismcore.tests.origin")
     private let listener: NWListener
-    private let media: Data
+    private var media: Data
     private let bytesPerSecond: Double
     private let firstByteDelay: Double
     private var nextWrite: TimeInterval = 0
@@ -28,14 +28,19 @@ final class RangeFixtureServer: @unchecked Sendable {
     /// default because it is also the honest model of Aether's range proxy,
     /// which synthesises its responses and forwards no `ETag` — the gap the
     /// probe-hints design calls the validator problem.
-    private let etag: String?
+    private var etag: String?
+    /// A `Last-Modified` date to publish, independent of `etag` — so a test
+    /// can model the origin that reports only a date.
+    private var lastModified: String?
+    private var rangeLog: [String] = []
     private var requestTimes: [TimeInterval] = []
     private var resumed = false
 
     init(media: Data, bytesPerSecond: Double = 4_000_000, firstByteDelay: Double = 0.02, refusals: Int = 0,
          drops: Int = 0, truncations: Int = 0, deniedStatus: Int? = nil, retryAfter: String = "1",
-         etag: String? = nil) throws {
+         etag: String? = nil, lastModified: String? = nil) throws {
         self.etag = etag
+        self.lastModified = lastModified
         self.truncations = truncations
         self.deniedStatus = deniedStatus
         self.retryAfter = retryAfter
@@ -50,6 +55,14 @@ final class RangeFixtureServer: @unchecked Sendable {
     }
 
     var requests: [TimeInterval] { queue.sync { requestTimes } }
+    /// Each request's `Range` header value (`-` for none), in arrival order.
+    var ranges: [String] { queue.sync { rangeLog } }
+    /// Publish a different validator from the next response on — the origin
+    /// replacing the file underneath a prewarm.
+    func setETag(_ value: String?) { queue.sync { etag = value } }
+    /// Serve different bytes from the next response on, validators untouched
+    /// — a file rewritten within the second its date names.
+    func setMedia(_ value: Data) { queue.sync { media = value } }
 
     func start() async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
@@ -96,6 +109,7 @@ final class RangeFixtureServer: @unchecked Sendable {
                 return
             }
             requestTimes.append(ProcessInfo.processInfo.systemUptime)
+            if drops > 0 || refusals > 0 || deniedStatus != nil { rangeLog.append("refused") }
             if drops > 0 { drops -= 1; close(connection); return }
             if let deniedStatus {
                 let retryHeader = [429, 503, 509].contains(deniedStatus) ? "Retry-After: \(retryAfter)\r\n" : ""
@@ -110,6 +124,7 @@ final class RangeFixtureServer: @unchecked Sendable {
                 return
             }
             let range = text.components(separatedBy: "\r\n").first { $0.lowercased().hasPrefix("range: bytes=") }
+            rangeLog.append(range.map { String($0.dropFirst("range: ".count)) } ?? "-")
             let bounds = range?.components(separatedBy: "=").last?.split(separator: "-", omittingEmptySubsequences: false)
             let start = bounds?.first.flatMap { Int($0) } ?? 0
             let requestedEnd = bounds.flatMap { $0.count > 1 ? Int($0[1]) : nil } ?? (media.count - 1)
@@ -117,7 +132,7 @@ final class RangeFixtureServer: @unchecked Sendable {
             let end = min(media.count - 1, requestedEnd)
             guard end >= start else { close(connection); return }
             let status = range == nil ? "200 OK" : "206 Partial Content"
-            let header = "HTTP/1.1 \(status)\r\nContent-Length: \(end - start + 1)\r\nContent-Range: bytes \(start)-\(end)/\(media.count)\r\nAccept-Ranges: bytes\r\n\(etag.map { "ETag: \($0)\r\n" } ?? "")Connection: close\r\n\r\n"
+            let header = "HTTP/1.1 \(status)\r\nContent-Length: \(end - start + 1)\r\nContent-Range: bytes \(start)-\(end)/\(media.count)\r\nAccept-Ranges: bytes\r\n\(etag.map { "ETag: \($0)\r\n" } ?? "")\(lastModified.map { "Last-Modified: \($0)\r\n" } ?? "")Connection: close\r\n\r\n"
             let truncate = truncations > 0
             if truncate { truncations -= 1 }
             queue.asyncAfter(deadline: .now() + firstByteDelay) {

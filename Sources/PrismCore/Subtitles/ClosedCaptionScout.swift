@@ -49,23 +49,12 @@ enum ClosedCaptionScout {
     }
 
     /// The framing and codec of a video track, or `nil` for a codec that has no
-    /// SEI to carry captions in.
+    /// SEI to carry captions in. The rule lives with the NAL walk, which the
+    /// HDR10+ scout shares.
     static func carriage(
         codecID: AVCodecID, nalUnitLengthSize: Int?
     ) -> (framing: HEVCNALUnits.Framing, codec: HEVCNALUnits.Codec)? {
-        let codec: HEVCNALUnits.Codec
-        switch codecID {
-        case AV_CODEC_ID_H264: codec = .h264
-        case AV_CODEC_ID_HEVC: codec = .hevc
-        default: return nil
-        }
-        // No `avcC`/`hvcC` means no length prefixes, which means Annex-B start
-        // codes — the shape the MPEG-TS demuxer produces, and the shape most
-        // captioned recordings arrive in.
-        if let lengthSize = nalUnitLengthSize, (1...4).contains(lengthSize) {
-            return (.lengthPrefixed(lengthSize), codec)
-        }
-        return (.annexB, codec)
+        HEVCNALUnits.carriage(codecID: codecID, nalUnitLengthSize: nalUnitLengthSize)
     }
 
     /// Consume packets from `input` looking for captions. **Leaves the read

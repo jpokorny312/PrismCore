@@ -41,6 +41,34 @@ final class HTTPOriginCoordinator: @unchecked Sendable {
         return false
     }
 
+    /// Admission for work nobody is waiting on — the source prewarm.
+    ///
+    /// Two differences from `acquire`, both so that optional work can never
+    /// cost a playback anything. It is admitted only while the origin has
+    /// NO request in flight, so the second of the two slots is always left
+    /// for a reader that a user is watching; and an origin that has refused
+    /// anyone in the last minute is not waited out but declined outright —
+    /// an origin that is shedding load is the last one to spend a speculative
+    /// request on, and waiting would only park a prewarm ahead of the
+    /// playback that eventually needs the slot.
+    func acquireYielding(_ origin: String, cancelled: () -> Bool) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        while !cancelled() {
+            let now = ProcessInfo.processInfo.systemUptime
+            var state = states[origin] ?? State()
+            if state.refusals > 0, now - state.lastRefusal <= 60 { return false }
+            if state.refusals > 0, now >= state.nextAdmission { state.refusals = 0 }
+            if state.active == 0, now >= state.nextAdmission {
+                state.active = 1
+                states[origin] = state
+                return true
+            }
+            _ = condition.wait(until: Date(timeIntervalSinceNow: 0.05))
+        }
+        return false
+    }
+
     func release(_ origin: String) {
         condition.lock()
         if var state = states[origin] {

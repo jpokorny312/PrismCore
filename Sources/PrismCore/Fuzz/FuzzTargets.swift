@@ -41,9 +41,58 @@ package enum FuzzTargets {
         "text-subtitles": { @Sendable in textSubtitles($0) },
         "a53-captions": { @Sendable in a53Captions($0) },
         "container-layout": { @Sendable in containerLayout($0) },
+        "hdr10plus-sei": { @Sendable in hdr10PlusSEI($0) },
     ]
 
     // MARK: - Targets
+
+    /// The HDR10+ scout's per-packet walk: NAL framing, the shared SEI message
+    /// loop, and the ST 2094-40 T.35 header test, under every carriage.
+    ///
+    /// The wrong answer this guards is a `seen` the bytes do not support —
+    /// it becomes a badge on a title that has no HDR10+. So a finding must be
+    /// attributable: it needs an SEI unit under it, a version the header test
+    /// can produce, and in length-prefixed carriage it must survive framing a
+    /// well-formed slice on either side (units there never influence each
+    /// other's parse, so a verdict that moves with a neighbour was reading
+    /// past its own unit).
+    package static func hdr10PlusSEI(_ bytes: [UInt8]) {
+        let carriages: [(HEVCNALUnits.Framing, HEVCNALUnits.Codec)] = [
+            (.annexB, .hevc), (.annexB, .h264), (.lengthPrefixed(4), .hevc),
+            (.lengthPrefixed(2), .hevc), (.lengthPrefixed(4), .h264),
+        ]
+        for (framing, codec) in carriages {
+            let version = bytes.withUnsafeBufferPointer {
+                HDR10PlusScout.applicationVersion(inPacket: $0, framing: framing, codec: codec)
+            }
+            guard let version else { continue }
+            guard (0...1).contains(version) else {
+                fatalError("application_version \(version) is not one ST 2094-40 defines")
+            }
+            var sawSEI = false
+            bytes.withUnsafeBufferPointer {
+                HEVCNALUnits.scan($0, framing: framing, codec: codec) { type, _ in
+                    if HEVCNALUnits.isSEI(type, codec: codec) { sawSEI = true }
+                }
+            }
+            guard sawSEI else { fatalError("HDR10+ reported from a packet with no SEI unit (\(framing))") }
+
+            guard case .lengthPrefixed(let size) = framing else { continue }
+            let sliceHeader: [UInt8] = codec == .hevc ? [0x02, 0x01] : [0x41]
+            let slice = sliceHeader + [0x9A, 0x55]
+            let prefix: [UInt8] = (0..<size).map { index in
+                UInt8((slice.count >> ((size - 1 - index) * 8)) & 0xFF)
+            }
+            for framed in [prefix + slice + bytes, bytes + prefix + slice] {
+                let again = framed.withUnsafeBufferPointer {
+                    HDR10PlusScout.applicationVersion(inPacket: $0, framing: framing, codec: codec)
+                }
+                guard again == version else {
+                    fatalError("a neighbouring slice changed the HDR10+ verdict: \(version) → \(String(describing: again))")
+                }
+            }
+        }
+    }
 
     /// The top-level element walk that produces a source's `headerBytes`,
     /// `firstClusterOffset` and `indexLocation`, over arbitrary bytes read as
@@ -68,6 +117,11 @@ package enum FuzzTargets {
             let layout = ContainerLayoutScanner.scan(formatName: format, byteSize: size, read: read)
             if let offset = layout.firstMediaOffset, offset < 0 || offset > size {
                 fatalError("\(format): media offset \(offset) is outside a \(size)-byte source")
+            }
+            // It aims the prewarm's tail request, so an offset past the file
+            // would be a range no origin can answer.
+            if let offset = layout.indexOffset, offset < 0 || offset >= size {
+                fatalError("\(format): index offset \(offset) is outside a \(size)-byte source")
             }
             if let header = layout.headerBytes, header < 0 || Int64(header) > size {
                 fatalError("\(format): header length \(header) is outside a \(size)-byte source")

@@ -12,6 +12,10 @@ let package = Package(
     ],
     products: [
         .library(name: "PrismCore", targets: ["PrismCore"]),
+        // A macOS diagnostic tool, not something a host links: probe, serve,
+        // bench and verify a source from a terminal, so a field report can be
+        // reproduced without a device build. See AGENTS.md *Measuring*.
+        .executable(name: "prismcore-cli", targets: ["prismcore-cli"]),
     ],
     dependencies: [
         // FFmpeg (LGPL) as prebuilt xcframeworks — the same package Aether
@@ -39,9 +43,19 @@ let package = Package(
                 .swiftLanguageMode(.v5),
             ]
         ),
+        .executableTarget(
+            name: "prismcore-cli",
+            dependencies: ["PrismCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+            ]
+        ),
         .testTarget(
             name: "PrismCoreTests",
-            dependencies: ["PrismCore"],
+            // The CLI too, so its stop handling is tested against the same
+            // fixtures and scripted origins as the library (`@testable
+            // import prismcore_cli`; SwiftPM links an executable into tests).
+            dependencies: ["PrismCore", "prismcore-cli"],
             resources: [
                 // Synthetic A/V fixtures (ffmpeg-generated testsrc2 + sine,
                 // seconds long) — enough to prove the remux round-trip and to

@@ -118,5 +118,18 @@ struct FuzzSmokeTests {
         let mp4 = layout(FuzzSeeds.faststartMP4Head, "mov,mp4,m4a,3gp,3g2,mj2")
         #expect(mp4.headerBytes != nil, "the MP4 seed never reached mdat")
         #expect(mp4.indexLocation == .head)
+
+        // The HDR10+ seeds must get past both decoys to the real message in
+        // each carriage — a seed the walk gives up on at the banner, or
+        // mistakes the caption message for, exercises neither test.
+        for (seed, framing) in [
+            (FuzzSeeds.hdr10PlusAccessUnit(annexB: false), HEVCNALUnits.Framing.lengthPrefixed(4)),
+            (FuzzSeeds.hdr10PlusAccessUnit(annexB: true), .annexB),
+        ] {
+            let version = seed.withUnsafeBufferPointer {
+                HDR10PlusScout.applicationVersion(inPacket: $0, framing: framing, codec: .hevc)
+            }
+            #expect(version == 1, "the HDR10+ seed never reached its message (\(framing))")
+        }
     }
 }

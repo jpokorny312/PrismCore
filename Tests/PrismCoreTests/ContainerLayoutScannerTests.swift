@@ -111,6 +111,7 @@ struct ContainerLayoutScannerTests {
         #expect(layout.firstMediaOffset == Int64(file.clusterOffset))
         #expect(layout.headerBytes == file.clusterOffset)
         #expect(layout.indexLocation == .tail)
+        #expect(layout.indexOffset == Int64(file.cuesOffset))
     }
 
     @Test("Cues written before the first Cluster read as an index at the head")
@@ -210,13 +211,15 @@ struct ContainerLayoutScannerTests {
     @Test("A non-faststart MP4 reports a tail index and no header length")
     func mp4TailMoov() throws {
         let ftyp = box("ftyp", [UInt8](repeating: 0x01, count: 16))
-        let bytes = ftyp + box("mdat", [UInt8](repeating: 0x03, count: 512))
-            + box("moov", [UInt8](repeating: 0x02, count: 128))
+        let mdat = box("mdat", [UInt8](repeating: 0x03, count: 512))
+        let bytes = ftyp + mdat + box("moov", [UInt8](repeating: 0x02, count: 128))
         let layout = ContainerLayoutScanner.scan(
             formatName: "mov,mp4,m4a,3gp,3g2,mj2", byteSize: Int64(bytes.count), read: reader(bytes)
         )
         #expect(layout.indexLocation == .tail)
         #expect(layout.firstMediaOffset == Int64(ftyp.count))
+        // Where the prewarm aims its tail request: the first byte past mdat.
+        #expect(layout.indexOffset == Int64(ftyp.count + mdat.count))
         // The bytes before `mdat` are not a metadata region worth reading —
         // the metadata is at the other end — so there is no header length to
         // report and reporting `ftyp.count` would size a first read that

@@ -559,16 +559,23 @@ public struct SourceInfo: Sendable, Equatable {
     /// The container's chapter marks, in start order. Empty for a source
     /// without them — most containers — never `nil`.
     public let chapters: [ChapterInfo]
+    /// What a bounded read of the video bitstream said about HDR10+
+    /// (ST 2094-40) metadata. `nil` when nobody asked — the default, because
+    /// asking costs packet reads (see `HDR10PlusScan`) — and when there is no
+    /// video track to ask about. Reporting only: nothing in the playlist or
+    /// the display criteria reads it.
+    public let hdr10Plus: HDR10PlusFinding?
 
-    /// Explicit so `subtitleTracks` (and later `chapters`) could be added
-    /// without breaking callers that predate them.
+    /// Explicit so `subtitleTracks` (and later `chapters`, `hdr10Plus`) could
+    /// be added without breaking callers that predate them.
     public init(
         formatName: String,
         duration: Double?,
         video: VideoTrackInfo?,
         audioTracks: [AudioTrackInfo],
         subtitleTracks: [SubtitleTrackInfo] = [],
-        chapters: [ChapterInfo] = []
+        chapters: [ChapterInfo] = [],
+        hdr10Plus: HDR10PlusFinding? = nil
     ) {
         self.formatName = formatName
         self.duration = duration
@@ -576,6 +583,17 @@ public struct SourceInfo: Sendable, Equatable {
         self.audioTracks = audioTracks
         self.subtitleTracks = subtitleTracks
         self.chapters = chapters
+        self.hdr10Plus = hdr10Plus
+    }
+
+    /// The same description with a scan's finding attached — `describe` runs
+    /// before the scan (and without it, on the remuxer's own context).
+    func with(hdr10Plus finding: HDR10PlusFinding?) -> SourceInfo {
+        SourceInfo(
+            formatName: formatName, duration: duration, video: video,
+            audioTracks: audioTracks, subtitleTracks: subtitleTracks,
+            chapters: chapters, hdr10Plus: finding
+        )
     }
 
     /// Text subtitle tracks PrismCore turns into WebVTT renditions.
@@ -726,7 +744,8 @@ public enum SourceProbe {
         coordinatedHTTP: Bool = false,
         input: PrismCoreInputFactory? = nil,
         structure: SourceStructureExport = .none,
-        hints: SourceOpenHints? = nil
+        hints: SourceOpenHints? = nil,
+        hdr10Plus: HDR10PlusScan = .off
     ) async throws -> ProbedSource {
         try Task.checkCancellation()
         let outcome: Result<ProbedSource, any Error> = await withCheckedContinuation { continuation in
@@ -734,7 +753,7 @@ public enum SourceProbe {
                 continuation.resume(returning: Result {
                     try open(url: url, httpHeaders: httpHeaders, budget: budget,
                              coordinatedHTTP: coordinatedHTTP, input: input,
-                             structure: structure, hints: hints)
+                             structure: structure, hints: hints, hdr10Plus: hdr10Plus)
                 })
             }
             // Kept alive by its own closure until it exits; nothing to join.
@@ -770,6 +789,9 @@ public enum SourceProbe {
     ///   make the open read *less*; may never make it read something else. A
     ///   hint that turns out not to describe these bytes is recorded in
     ///   `ProbedSource.hints` and otherwise ignored.
+    /// - Parameter hdr10Plus: whether to read video packets looking for HDR10+
+    ///   metadata. `.off` (the default) reads nothing and leaves
+    ///   `SourceInfo.hdr10Plus` `nil`; see `HDR10PlusScan` for the cost.
     public static func open(
         url: URL,
         httpHeaders: [String: String] = [:],
@@ -777,7 +799,8 @@ public enum SourceProbe {
         coordinatedHTTP: Bool = false,
         input inputFactory: PrismCoreInputFactory? = nil,
         structure structureExport: SourceStructureExport = .none,
-        hints: SourceOpenHints? = nil
+        hints: SourceOpenHints? = nil,
+        hdr10Plus hdr10PlusScan: HDR10PlusScan = .off
     ) throws -> ProbedSource {
         // The interrupt guard has to exist BEFORE the open — the blocking
         // reads check the URLContext's copy of the callback, taken at
@@ -878,8 +901,23 @@ public enum SourceProbe {
         // it leaves behind is the adopting producer's to fix (it seeks to its
         // own start anyway), and the verdict is worth far more than the rewind
         // costs.
-        let info = describe(input: input, verifyingInterlace: true)
+        var info = describe(input: input, verifyingInterlace: true)
         let describedAt = clock.now
+
+        // Right after `describe`, before the structure export, for two
+        // reasons. It consumes packets exactly like the interlace
+        // verification, and the first ones it reads are those
+        // `find_stream_info` left buffered — free, where after the export's
+        // seeks they would be fresh reads. And the export promises to put the
+        // byte position back where it found it, so running second it still
+        // does; the adopting producer rewinds either way.
+        var scanDuration: Duration = .zero
+        if let budget = hdr10PlusScan.videoPacketBudget, let video = info.video {
+            info = info.with(hdr10Plus: HDR10PlusScout.scan(
+                input: input, video: video, videoPacketBudget: budget
+            ))
+            scanDuration = describedAt.duration(to: clock.now)
+        }
 
         // Both after `describe`, and in this order. The structure export may
         // move the read position (the index load is a seek to the tail and
@@ -915,7 +953,8 @@ public enum SourceProbe {
             timing: ProbeTiming(
                 open: probeStart.duration(to: openedAt),
                 streamInfo: openedAt.duration(to: analyzedAt),
-                describe: analyzedAt.duration(to: describedAt)
+                describe: analyzedAt.duration(to: describedAt),
+                hdr10PlusScan: scanDuration
             )
         )
     }

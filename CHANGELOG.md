@@ -8,6 +8,253 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [3.2.5] — 2026-09-30
+
+Keeps host cue-tap subtitles on the plan's timeline origin after an early
+demand re-anchor (resume/seek), including the muxed+bridge shape since 3.2.4.
+A patch release, per the host pin discipline.
+
+### Fixed
+
+- **Embedded text subtitle cues from the host cue tap no longer land in the
+  past after a resume or seek on a demand-driven session** (muxed+bridge
+  included, since 3.2.4). A re-anchor that arrived before the head keyframe
+  made the anchor the timeline origin. Planned mode now takes the origin from
+  the plan's first entry.
+
+## [3.2.4] — 2026-09-30
+
+Two AudioBridge fixes from contributor PR #104 (@jpokorny312), landed via
+#109. An `aac` bridge target no longer produces a PCE-described layout that
+makes AVPlayer reject the master. Demand-driven seeking now covers the muxed
+shape with a bridged track, so Resume no longer restarts the remux from
+0:00. A patch release, per the host pin discipline.
+
+### Fixed
+
+- **A bridged 5.1(side) or 7.1 track encoded to `aac` no longer fails the
+  whole master in AVPlayer.** FFmpeg's `aac` encoder describes a layout that
+  is not in the MPEG-4 channel-configuration table, such as 5.1 with side
+  surrounds or any 8-channel layout, with a Program Config Element (PCE).
+  AudioToolbox does not reliably decode PCE-only configs, so AVPlayer
+  rejected the asset and logged nothing about why. An `aac` target now gets
+  the standard layout for the channel count (`av_channel_layout_default`,
+  capped at 6 channels), which always has an implicit channelConfiguration.
+  The resampler maps the source onto it. Side/back position is lost and 7.1
+  is downmixed to 5.1, which AVPlayer could not have rendered anyway. EAC3
+  targets are unaffected. New hermetic tests
+  (`aacSideSurroundAvoidsPCE`, `aacSevenOneCapsAtFiveOne`,
+  `aacStereoUnchanged`) read the channelConfiguration from the encoder's
+  AudioSpecificConfig. They fail on 3.2.3 (PCE, config 0) and pass now.
+  (#104, thanks @jpokorny312)
+- **Seeking a muxed source with a bridged audio track no longer restarts
+  the remux from the beginning.** Demand-driven seeking skipped the muxed
+  shape when its audio went through the bridge. So Resume or a chapter jump
+  on, for example, a DTS source with two audio renditions that collide on
+  name (which forces muxed shape) silently fell back to sequential
+  production from 0:00. `HLSRemuxer.reanchor(to:)` now handles the muxed
+  bridge the way `AudioRenditionWriter.reanchor` already handles a bridged
+  rendition. It calls `AudioBridge.reset()` and rebuilds the bridge only
+  when it has already drained at EOF. (#104, thanks @jpokorny312)
+
+## [3.2.3] — 2026-09-30
+
+Three landings: a command-line tool with diagnostics it shares with the tests
+(#105, `prismcore-cli`), a way for a host to fetch a source's first bytes
+before it plays it (#106, `PrismCoreEngine.prewarm`), and HDR10+
+(ST 2094-40) detection from the bitstream, which is opt-in and reporting only
+(#107). Shipped as a patch although it adds API, per the host pin
+discipline: a release a host takes is always a patch bump.
+
+### Added
+
+- **`prismcore-cli`: reproduce a field report from a terminal.** A new macOS
+  executable product with five subcommands, each answering one question a
+  report usually asks:
+
+  | Command | Answers |
+  |---|---|
+  | `probe` | What did the probe see, and where does the source route (`SourceInfo`, structure, phase timings, `decide` verdict with its reason)? |
+  | `serve` | Does the served HLS play? (prints a loopback playlist URL for Safari or QuickTime, stops cleanly on Enter, Ctrl-C or `--for`) |
+  | `bench` | Where did startup spend its time? (the host log's checkpoint line, `--runs N` for the spread) |
+  | `segverify` | Is every segment decodable on its own? (names each bad segment and says why) |
+  | `validate` | Does Apple's `mediastreamvalidator` accept the master? (plus `hlsreport` when installed) |
+
+  Until now the only ways to see these were opt-in test harnesses or a device
+  build. The shared options are HTTP headers (`-H`), `--coordinated-http`,
+  `--budget`, `--display sdr|hdr|dv` and `-v`. Exit codes tell a failed check
+  (1) from an unreadable source (2), a source that routes away from remux
+  (3), a usage error (64), a missing file (66), a check that could not be
+  made (69: a missing validator under `--require-validator`, or a `segverify`
+  stream with no decoder in this build) and an interrupt (130). Ctrl-C
+  reaches the probe and `start()` too, not only the running check; `serve`
+  exits 0 on a Ctrl-C after its URL is out, since that is how it is meant to
+  end. There is no new dependency: arguments are parsed by hand.
+
+  `validate` is **opt-in** on Apple's HTTP Live Streaming Tools, which CI does
+  not have. A missing validator prints a notice and exits 0, unless
+  `--require-validator` is passed. The tools are found through `PATH`,
+  `$PRISMCORE_MEDIASTREAMVALIDATOR` or `$PRISMCORE_HLSREPORT`. The hermetic
+  suite never runs them.
+
+  None of this replaces a device run. The tvOS display handshake, Dolby
+  Vision on a panel and Atmos passthrough are still decided on hardware.
+  See AGENTS.md *Measuring*.
+
+- **Shared diagnostics, `package` access.** The CLI and the tests share this
+  code instead of each keeping a copy that could drift:
+  - `StartupCheckpointRun` is the probe → session → checkpoints measurement
+    and its three-line rendering. `StartupCheckpointBenchmark` now prints
+    through it, and `DiagnosticsTests.checkpointLineShape` pins the line's
+    shape hermetically, where before only the opt-in harness exercised it.
+  - `SegmentVerifier` fetches each served segment over HTTP and decodes init
+    plus that one fragment with a fresh libavformat/libavcodec pair. It
+    reports:
+    - a non-key opening picture
+    - demux and decode errors
+    - frames flagged corrupt
+    - pictures lost to missing references
+    - a segment that is listed but not served
+    - an `#EXTINF` far from the media's length (warning)
+    - a check it could not make (`unverified`, never a pass): a stream with
+      no decoder in this build, a segment that left a sliding window before
+      it was fetched, encrypted segments
+
+    It honours `EXT-X-BYTERANGE` and `EXT-X-MAP` `BYTERANGE` (each segment is
+    its own range, with the map in force at it), follows a playlist that has
+    not ended by media sequence rather than position, and sends the caller's
+    HTTP headers on every request.
+
+    An open GOP's leading pictures, which a decoder starting at a CRA skips,
+    are a warning, not a failure: stream copy cannot change the source's GOP
+    structure. The `hevc_eac3.mkv` fixture carries one, and system `ffprobe`
+    also decodes 144 of that segment's 145 packets.
+  - `PrismCoreLog.observer` is now `package`, so `-v` can put engine notices
+    next to the output they explain.
+  - `LibraryLogLevel` quiets libav*'s per-session muxer warnings in the CLI.
+    It is never called from the library.
+
+- **`PrismCoreEngine.prewarm(url:httpHeaders:byteBudget:)` — fetch a
+  source's first bytes before the host plays it.** A host that knows what is
+  likely next (the following episode, the item under the cursor) can prewarm
+  it: the first megabyte and, when the container names a tail index, a
+  window ending at the end of the file that covers it (a Matroska's Cues and
+  the last cluster before them, which is where the segment plan's index load
+  lands; or a trailing `moov` for MP4) go into an in-memory store. That is at
+  most two bounded range requests. When a later open reads the same URL with the same
+  headers over the coordinated HTTP reader (`coordinatedHTTP: true`), the
+  reader takes those blocks into its cache instead of fetching them.
+  `ProbedSource.prewarm` reports what happened (`adopted`, `stale`,
+  `unverified`, `none`).
+
+  The rules, and why:
+  - **Validator check before the first delivered byte.** The reader asks the
+    origin for one byte first, and takes the blocks only if the strong
+    `ETag`, the length and that byte all still match. Otherwise it drops the
+    entry and reads the network as usual. An origin that reports no strong
+    `ETag` cannot be prewarmed at all: stale bytes would give the demuxer a
+    wrong parse, not just a slow one. That includes an origin that reports
+    only `Last-Modified` — at one-second resolution it cannot tell apart two
+    versions of a file written within the same second, and when the length
+    and first byte survive the rewrite every other check passes. A host
+    range proxy that forwards no `ETag` therefore has to forward its
+    origin's (or synthesise one from the file's size and a sub-second mtime,
+    or a content hash) before a prewarm through it can do anything. This is the
+    3.2.0 hints rule, and that confirming response is also what the hints'
+    `expectedValidator` is judged on.
+  - **Hard memory bounds.** Each prewarm is capped at 2 MB, half the
+    reader's 4 MB retention, so taking it over never makes the reader evict
+    the header it will come back to. The process-wide store is capped at 16 MB (least recently used goes
+    first), and everything is dropped on the first memory-pressure warning.
+  - **Origin capacity comes first.** Prewarm requests go through
+    `HTTPOriginCoordinator` at lower priority. They are admitted only while
+    no other request to that origin is in flight, so one of the two slots
+    always stays free for playback. They are declined outright within a
+    minute of a refusal. A 429 / 503 / 509 is recorded for everyone and not
+    retried.
+  - Only the coordinated reader consults the store. FFmpeg's native HTTP and
+    host-supplied inputs behave exactly as before.
+
+  `ContainerLayoutScanner` now also reports where the index element starts
+  (`indexOffset`), which the prewarm uses to aim its tail fetch; the
+  outcome's `indexPrewarmed` is `true` only when the stored bytes at that
+  offset really are the index (the Cues element ID, or a `moov` box after
+  `mdat`), and `requests` counts only requests the origin was sent.
+  `Scripts/proxy-model-server.py` gains `VALIDATOR=1` to model a host proxy
+  that forwards its origin's validator, and `StartupCheckpointBenchmark`
+  gains `PRISMCORE_BENCH_PREWARM=1` (via `StartupCheckpointRun.measure(prewarm:)`,
+  which prints the prewarm on its own line ahead of the probe line and appends
+  `prewarm-use` to it). No performance claim is made here; the
+  measurement belongs with the PR.
+
+- **HDR10+ (SMPTE ST 2094-40) detection, read from the bitstream.** Containers
+  never declare HDR10+. The metadata rides each picture as an SEI
+  `user_data_registered_itu_t_t35` message with Samsung's T.35 header, and
+  stream-copy already carried it through untouched, but the engine had no
+  way to know it was there. `SourceProbe.open(…, hdr10Plus: .standard)` (and
+  `openDetached`) now walks at most 24 video packets, stopping at the first
+  message, and reports the result as `SourceInfo.hdr10Plus`
+  (`HDR10PlusFinding`). The answer has three values: `seen` (with the
+  `application_version`), `notSeenWithinBudget`, or `unknown(reason)`, where
+  the reason is a codec whose SEI is not walked (AV1, VP9), an unseekable
+  input, a failed or interrupted read, or no video packets. A scan that
+  finds nothing cannot prove there is no HDR10+ further in, so there is
+  deliberately no "absent" value.
+
+  The scan is **opt-in**. The default `.off` reads nothing and leaves the
+  field `nil`, so a routing-only probe pays no extra I/O on the way to its
+  verdict. Its cost shows up separately as `ProbeTiming.hdr10PlusScan`. It
+  runs right after `describe`, so its first reads are the packets
+  `avformat_find_stream_info` already buffered, and an adopted context is
+  rewound by the producer as before (a test checks that the head segment
+  starts at `tfdt` 0 and still carries the SEI byte for byte). When the
+  adopted context was scanned, the producer rewinds it **before** the
+  closed-caption scout as well: the scout reads packets from wherever the
+  context stands, and after a scan that ran to EOF it read none, so a source
+  captioned on every picture lost its CC1 rendition. That rewind is one
+  extra seek (a Range request over HTTP), paid only by hosts that opted in;
+  a test compares the master and the served caption cues with the scan off
+  and on.
+
+  The NAL framing, the SEI message loop, emulation-prevention removal and
+  the carriage choice now live in `HEVCNALUnits`, shared with the A/53
+  caption reader. Only the T.35 header test belongs to the scout. There is a
+  new fuzz target, `hdr10plus-sei`, with a seed that puts a
+  `structure_of_pictures_info` (payload type 128), a message of an extended
+  payload type, an encoder banner and an A/53 caption message ahead of the
+  HDR10+ one. Its checks: a `seen`
+  needs an SEI unit under it and a defined version, and in length-prefixed
+  carriage, adding a slice on either side must not change the verdict.
+
+  **Detection and reporting only.** `VIDEO-RANGE`, the master playlist and
+  `DisplayCriteriaController` are unchanged, and a test pins the scanned and
+  unscanned masters as byte-identical. Whether AVPlayer and tvOS render
+  HDR10+ from HLS-fMP4, and whether any playlist or display-criteria signal
+  changes that, needs a named device run on an HDR10+ panel. None has been
+  done yet. A wrong HDR variant is a `-11868` rejection, so nothing ships on
+  a guess. HDR10+ carried only as Matroska `BlockAdditional` side data (the
+  WebM/VP9 form) is not scanned: stream-copy to fMP4 would not carry it
+  anyway.
+
+  The fixtures `hevc_hdr10plus.mkv` and `hevc_hdr10plus.ts` are 10-bit PQ
+  HEVC with a real ST 2094-40 SEI on every picture. The encoder available to
+  CI cannot write HDR10+, so `Fixtures/inject_hdr10plus_sei.py` adds it, and
+  FFmpeg's own decoder reads it back as "HDR Dynamic Metadata SMPTE2094-40
+  (HDR10+)". That check keeps the tests from only agreeing with our own
+  reading of the syntax. `Fixtures/generate_hdr10plus.sh` regenerates both
+  files.
+
+### Fixed
+
+- **The SEI message loop no longer stops at payload type 128 or at an
+  extended payload type.** It took any message starting with `0x80` for
+  `rbsp_trailing_bits`, although `structure_of_pictures_info` is payload
+  type 128, and it bounded an extended payload *type* (`FF 05` = 260) by the
+  buffer size as if it were a length. Either one ended the walk, and any
+  A/53 caption or HDR10+ message behind it went unread. The stop bit is now
+  found by position (the last non-zero byte of the RBSP), and only the
+  payload *size* is checked against the buffer.
+
 ## [3.2.2] — 2026-09-24
 
 A memory fix for every host that plays over the coordinated HTTP reader.
@@ -2276,7 +2523,10 @@ HTTP server, with:
 - **Software path** — libavcodec into `AVSampleBufferDisplayLayer` for the video
   AVPlayer cannot decode at all.
 
-[Unreleased]: https://github.com/Wenzlik/PrismCore/compare/3.2.2...HEAD
+[Unreleased]: https://github.com/Wenzlik/PrismCore/compare/3.2.5...HEAD
+[3.2.5]: https://github.com/Wenzlik/PrismCore/compare/3.2.4...3.2.5
+[3.2.4]: https://github.com/Wenzlik/PrismCore/compare/3.2.3...3.2.4
+[3.2.3]: https://github.com/Wenzlik/PrismCore/compare/3.2.2...3.2.3
 [3.2.2]: https://github.com/Wenzlik/PrismCore/compare/3.2.1...3.2.2
 [3.2.1]: https://github.com/Wenzlik/PrismCore/compare/3.2.0...3.2.1
 [3.2.0]: https://github.com/Wenzlik/PrismCore/compare/3.1.1...3.2.0
