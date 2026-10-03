@@ -10,6 +10,41 @@ source-compatible.)
 
 ### Fixed
 
+- **A seek no longer ends the remux a minute later on a file with reordered
+  pictures.** After a demand-driven re-anchor libavformat's demuxer hands out
+  the first `video_delay` packets of a B-frame stream (4 on a 1080p Blu-ray
+  remux) without a DTS, and the packet after them carries the first real one.
+  The timestamp sanitizer leaves those packets to the mp4 muxer on purpose (a
+  first packet's PTS is no stand-in for its DTS where pictures are reordered),
+  and the muxer numbers them with a formula of its own. Where the segment
+  opens on an open-GOP keyframe, whose leading pictures follow it in decode
+  order, on Matroska's uneven millisecond timestamps, its number for the third
+  or fourth packet landed a couple of milliseconds above the real DTS of the
+  fifth. `av_interleaved_write_frame` answered `-22`, the producer stopped,
+  and AVPlayer ran dry once it had played out its buffer. The writer now
+  holds those few packets (`LeadingDTSBackfill`) until the first real DTS
+  arrives and numbers them backwards from it, one frame apart and never
+  later than their own PTS, ahead of the sanitizer. At the start of a file,
+  and wherever the muxer's numbers happened to work, the output is
+  byte-for-byte what it was. Found with a 24 GB 1080p remux (H.264, DTS-HD):
+  14 of 19 jump targets across the film failed on 3.2.6, none do now. New
+  tests (`LeadingDTSBackfillTests`, `FMP4SegmentWriterFirstPacketTests`)
+  replay the packet sequence of a failing re-anchor against the real mp4
+  muxer; the second fails on 3.2.6 with the same `-22`.
+- **A bridged `aac` track no longer carries frames of the old position across
+  a re-anchor.** FFmpeg's native `aac` encoder (the bridge target in every
+  build without an `eac3` encoder) keeps two frames of look-ahead and has no
+  `AV_CODEC_CAP_ENCODER_FLUSH`, so the `avcodec_flush_buffers` in
+  `AudioBridge.reset()` did nothing to it. After a jump to an earlier position
+  the first packets were stamped with the old position's times (`Queue input
+  is backward in time`), ahead of everything the new position produces after
+  them: the muxer refuses that step back (`non monotonically increasing dts`,
+  `-22`), and the timestamp repair would answer it by stacking the packets
+  behind them one tick apart. An encoder that delays its output and cannot be
+  flushed is now re-opened with the same parameters on reset; its stream
+  description is identical, so an init segment already served stays valid.
+  `AudioBridge.reset()` can therefore throw. New test
+  `aacResetDropsTheOldPosition` fails without the change.
 - **Two audio tracks with the same name no longer make AVPlayer reject the
   master.** Untitled tracks sharing a language were both declared with the
   bare localized language name, violating HLS's per-group `NAME` uniqueness

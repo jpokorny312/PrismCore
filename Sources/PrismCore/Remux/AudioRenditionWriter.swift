@@ -235,10 +235,11 @@ final class AudioRenditionWriter {
                 self.bridge = nil
                 try open(input: input, restart: true)
             } else {
-                // The bridge stays: its buffered state is reset, its contexts
-                // live on (`AudioBridge.reset`). Only the muxer is new — tfdt
+                // The bridge stays: its buffered state is reset, its decoder
+                // lives on (`AudioBridge.reset`; an encoder that delays its
+                // output is re-opened there). Only the muxer is new — tfdt
                 // continuity under frag_discont needs a fresh one.
-                bridge?.reset()
+                try bridge?.reset()
                 try openMuxer(input: input, restart: true)
             }
         } else {

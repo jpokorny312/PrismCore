@@ -385,16 +385,29 @@ final class AudioBridge {
         if encoderCtx != nil { avcodec_free_context(&encoderCtx) }
     }
 
-    /// Re-anchor without rebuilding: the decoder, encoder, resampler and
-    /// filter graph all survive a demand-driven seek, only their BUFFERED
-    /// state is stale — decoder frames from before the jump, PCM in the
-    /// FIFO, the resampler's delay line, and the clock's notion of where the
-    /// next frame should land. Opening a fresh bridge per seek (decoder open,
-    /// encoder open, FIFO, frame allocations — per rendition, per seek) was
-    /// most of what a scrub cost on a bridged track; this is the cheap
-    /// equivalent. The muxer is still rebuilt by the caller (frag_discont
-    /// needs a new one for the tfdt), and the encoder is NOT flushed: every
-    /// `send_frame` is drained on the spot, so it holds nothing.
+    /// Re-anchor without rebuilding: the decoder, resampler and filter graph
+    /// all survive a demand-driven seek, only their BUFFERED state is stale —
+    /// decoder frames from before the jump, PCM in the FIFO, the resampler's
+    /// delay line, and the clock's notion of where the next frame should land.
+    /// Opening a fresh bridge per seek (decoder open, encoder open, FIFO,
+    /// frame allocations — per rendition, per seek) was most of what a scrub
+    /// cost on a bridged track; this is the cheap equivalent. The muxer is
+    /// still rebuilt by the caller (frag_discont needs a new one for the tfdt).
+    ///
+    /// The encoder is the one codec context that does NOT simply survive.
+    /// EAC3 hands back a packet for every frame it is given, so it holds
+    /// nothing — but the native `aac` encoder (the target in every build
+    /// without an eac3 encoder, i.e. stock MPVKit) keeps two frames of
+    /// look-ahead/overlap, and it has no `AV_CODEC_CAP_ENCODER_FLUSH`, so
+    /// `avcodec_flush_buffers` is a no-op on it. Those two frames belong to the
+    /// position before the jump: the first packets after a re-anchor to an
+    /// EARLIER position were stamped with the old position's times
+    /// (`Queue input is backward in time`), and the muxer refused the step
+    /// back (`non monotonically increasing dts`, `av_interleaved_write_frame`
+    /// -22) — which ended the remux, and with it the playback, a minute after
+    /// the seek, when AVPlayer had played out what it had buffered. Such an
+    /// encoder is re-opened with the same parameters instead; that is a few
+    /// milliseconds, nothing like the cost of a whole new bridge.
     ///
     /// Not after `flush`: EOF put both codec contexts into their terminal
     /// drain state, and while `avcodec_flush_buffers` revives a decoder, an
@@ -404,7 +417,7 @@ final class AudioBridge {
     /// caller to rebuild instead; a re-anchor after EOF is the rarer case.
     var isDrained: Bool { drained }
 
-    func reset() {
+    func reset() throws {
         progress = AudioBridgeProgress()
         progress.encoderFrameSamples = Int(encoderCtx?.pointee.frame_size ?? 0)
         onProgress?(progress)
@@ -419,6 +432,47 @@ final class AudioBridge {
         boostFilter?.reset()
         chunker.reset()
         clock.reset()
+        try reopenEncoderIfItKeepsFrames()
+    }
+
+    /// Replaces an encoder that still holds frames of the old position (see
+    /// `reset()`) by a freshly opened one with the same parameters. The muxer
+    /// the caller builds next reads its stream description from the new
+    /// context; it is identical (same layout, rate, bit rate, global header),
+    /// so the init segment already served stays valid.
+    private func reopenEncoderIfItKeepsFrames() throws {
+        guard let old = encoderCtx, let codec = old.pointee.codec else { return }
+        let capabilities = codec.pointee.capabilities
+        // Only an encoder that delays its output has anything left inside, and
+        // only one without ENCODER_FLUSH cannot be emptied in place.
+        guard capabilities & AV_CODEC_CAP_DELAY != 0, capabilities & AV_CODEC_CAP_ENCODER_FLUSH == 0 else { return }
+
+        guard let fresh = avcodec_alloc_context3(codec) else {
+            throw Failure.allocationFailed("encoder context")
+        }
+        var candidate: UnsafeMutablePointer<AVCodecContext>? = fresh
+        do {
+            try FFmpegError.check(
+                av_channel_layout_copy(&fresh.pointee.ch_layout, &old.pointee.ch_layout),
+                "av_channel_layout_copy(encoder, re-anchor)"
+            )
+            fresh.pointee.sample_rate = old.pointee.sample_rate
+            fresh.pointee.sample_fmt = old.pointee.sample_fmt
+            fresh.pointee.bit_rate = old.pointee.bit_rate
+            fresh.pointee.time_base = old.pointee.time_base
+            // The only flag `init` sets; the others on `old` may have been
+            // changed by the encoder itself when it opened.
+            if old.pointee.flags & AV_CODEC_FLAG_GLOBAL_HEADER != 0 {
+                fresh.pointee.flags |= AV_CODEC_FLAG_GLOBAL_HEADER
+            }
+            try FFmpegError.check(avcodec_open2(fresh, codec, nil), "avcodec_open2(encoder, re-anchor)")
+        } catch {
+            avcodec_free_context(&candidate)
+            throw error
+        }
+        var previous: UnsafeMutablePointer<AVCodecContext>? = old
+        encoderCtx = fresh
+        avcodec_free_context(&previous)
     }
 
     // MARK: - Output stream description

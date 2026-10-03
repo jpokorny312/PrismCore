@@ -534,6 +534,49 @@ struct AudioBridgePipelineTests {
         #expect(timestamps.count < 20, "no silence was invented to cover the gap")
     }
 
+    @Test("A re-anchor to an earlier position leaves nothing of the old one in the aac encoder")
+    func aacResetDropsTheOldPosition() throws {
+        guard avcodec_find_encoder(AV_CODEC_ID_AAC) != nil else { return }
+        let par = makeCodecpar(channels: 2)
+        defer { var par: UnsafeMutablePointer<AVCodecParameters>? = par; avcodec_parameters_free(&par) }
+        let bridge = try AudioBridge(
+            codecpar: par,
+            timeBase: AVRational(num: 1, den: Self.sampleRate),
+            globalHeader: true,
+            targetCodec: AV_CODEC_ID_AAC
+        )
+        defer { bridge.close() }
+
+        // Ten seconds in; the encoder takes in more than it hands back (its
+        // look-ahead and overlap), so it is holding frames of this position
+        // when the jump comes.
+        let oldStart: Int64 = 10 * Int64(Self.sampleRate)
+        for index in 0..<30 {
+            let packet = makePacket(samples: 1_000, channels: 2, pts: oldStart + Int64(index) * 1_000)
+            defer { var packet: UnsafeMutablePointer<AVPacket>? = packet; av_packet_free(&packet) }
+            try bridge.feed(packet) { _ in }
+        }
+
+        // The jump back, as the demand-driven producer does it.
+        try bridge.reset()
+
+        var stamps: [Int64] = []
+        let newStart: Int64 = 2 * Int64(Self.sampleRate)
+        for index in 0..<30 {
+            let packet = makePacket(samples: 1_000, channels: 2, pts: newStart + Int64(index) * 1_000)
+            defer { var packet: UnsafeMutablePointer<AVPacket>? = packet; av_packet_free(&packet) }
+            try bridge.feed(packet) { stamps.append($0.pointee.pts) }
+        }
+        try bridge.flush { stamps.append($0.pointee.pts) }
+
+        #expect(!stamps.isEmpty)
+        // Frames of the old position would come out first, stamped ten seconds
+        // late: the muxer refuses the step back and the remux ends.
+        #expect(stamps.allSatisfy { $0 < oldStart }, "a packet of the old position came out after the jump")
+        #expect(stamps == stamps.sorted())
+        #expect(stamps.first.map { $0 >= newStart - 1_024 } == true)
+    }
+
     // MARK: - AAC layout negotiation (#104)
 
     /// The AudioSpecificConfig's 4-bit channelConfiguration, read from the

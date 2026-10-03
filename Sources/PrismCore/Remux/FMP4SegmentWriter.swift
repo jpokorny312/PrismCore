@@ -40,6 +40,12 @@ final class FMP4SegmentWriter {
     /// sanitizer still holding the old position's last DTS would clamp the
     /// first packets after a backward seek up to it.
     private var sanitizers: [Int: TimestampSanitizer] = [:]
+    /// One per output stream that reorders pictures (`video_delay > 0`): holds
+    /// the packets such a stream comes without a DTS (its first ones after a
+    /// seek) until the first real one arrives and numbers them from it — see
+    /// `LeadingDTSBackfill`. A writer is rebuilt at every re-anchor, so nothing
+    /// is carried across a seek.
+    private var leadingDTS: [Int: LeadingDTSBackfill<UnsafeMutablePointer<AVPacket>>] = [:]
     private var ioBuffer: UnsafeMutableRawPointer?
 
     /// input stream index → output stream index
@@ -47,6 +53,9 @@ final class FMP4SegmentWriter {
 
     deinit {
         // Normal teardown runs `finish()`; this is the error-path backstop.
+        for index in Array(leadingDTS.keys) {
+            for release in leadingDTS[index]?.drain() ?? [] { Self.free(release) }
+        }
         if let output {
             avformat_free_context(output)
         }
@@ -135,6 +144,10 @@ final class FMP4SegmentWriter {
                 av_dict_set(&outStream.pointee.metadata, "language", language, 0)
             }
             streamMap[Int(entry.inputIndex)] = outStream.pointee.index
+            if outStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO,
+               outStream.pointee.codecpar.pointee.video_delay > 0 {
+                leadingDTS[Int(outStream.pointee.index)] = LeadingDTSBackfill()
+            }
         }
 
         // Custom AVIO: the muxer writes, the sink collects. 64 KiB transfer
@@ -220,6 +233,20 @@ final class FMP4SegmentWriter {
     /// each caller: a path that skipped it would fail the whole remux on the
     /// first bad DTS.
     func write(_ packet: UnsafeMutablePointer<AVPacket>) throws {
+        // A stream that reorders pictures has no DTS for its first packets
+        // after a seek: they wait here for the first real one, which numbers
+        // them (`LeadingDTSBackfill`), and only then are repaired and muxed.
+        let index = Int(packet.pointee.stream_index)
+        if leadingDTS[index]?.isSettled == false {
+            try writeNumberingLeadingPackets(packet, streamIndex: index)
+            return
+        }
+        try repairAndMux(packet)
+    }
+
+    /// Repair the packet's timestamps, apply the audio delay, and hand it to the
+    /// muxer.
+    private func repairAndMux(_ packet: UnsafeMutablePointer<AVPacket>) throws {
         guard let output else { return }
         let index = Int(packet.pointee.stream_index)
         if index >= 0, index < Int(output.pointee.nb_streams), let stream = output.pointee.streams[index] {
@@ -256,6 +283,73 @@ final class FMP4SegmentWriter {
         )
     }
 
+    private typealias Release = LeadingDTSBackfill<UnsafeMutablePointer<AVPacket>>.Release
+
+    /// Frees the packet of a release that was held (the one in hand belongs to
+    /// the caller).
+    private static func free(_ release: Release) {
+        guard case .held(let held) = release.item else { return }
+        var owned: UnsafeMutablePointer<AVPacket>? = held
+        av_packet_free(&owned)
+    }
+
+    /// The packet either waits (a copy of it is kept) for the first real DTS of
+    /// its stream, or arrives with that DTS and releases the ones that waited,
+    /// numbered from it.
+    private func writeNumberingLeadingPackets(
+        _ packet: UnsafeMutablePointer<AVPacket>,
+        streamIndex index: Int
+    ) throws {
+        let dts = packet.pointee.dts
+        let pts = packet.pointee.pts
+        let releases = try leadingDTS[index]!.admit(
+            dts: dts == swift_AV_NOPTS_VALUE() ? nil : dts,
+            pts: pts == swift_AV_NOPTS_VALUE() ? nil : pts,
+            duration: packet.pointee.duration,
+            hold: {
+                // A reference to the same buffer: the caller unreferences its
+                // own packet as soon as this call returns.
+                guard let copy = av_packet_clone(packet) else {
+                    throw FFmpegError(code: -1, operation: "av_packet_clone")
+                }
+                return copy
+            }
+        )
+        try mux(releases, current: packet)
+    }
+
+    /// Writes released packets in order, giving each the DTS it was assigned.
+    /// The held ones are owned here and freed whatever happens.
+    private func mux(_ releases: [Release], current: UnsafeMutablePointer<AVPacket>?) throws {
+        var handled = 0
+        defer {
+            for release in releases[handled...] { Self.free(release) }
+        }
+        for release in releases {
+            handled += 1
+            defer { Self.free(release) }
+            switch release.item {
+            case .held(let held):
+                if let dts = release.dts { held.pointee.dts = dts }
+                try repairAndMux(held)
+            case .current:
+                guard let current else { continue }
+                if let dts = release.dts { current.pointee.dts = dts }
+                try repairAndMux(current)
+            }
+        }
+    }
+
+    /// Writes out whatever the backfill still holds, with the timestamps those
+    /// packets have: a fragment or the stream ends before a stream's first real
+    /// DTS came, and a held packet must not be lost to that.
+    private func releaseHeldPackets() throws {
+        for index in leadingDTS.keys.sorted() {
+            guard let releases = leadingDTS[index]?.drain(), !releases.isEmpty else { continue }
+            try mux(releases, current: nil)
+        }
+    }
+
     /// Flush the current fragment. Returns the init segment too when this is
     /// the FIRST cut: draining the interleave queue is what actually delivers
     /// packets into movenc (feeding `av_interleaved_write_frame` only queues
@@ -266,6 +360,7 @@ final class FMP4SegmentWriter {
     /// and keeps queued samples; the second closes the fragment.
     func cutSegment() throws -> (initSegment: Data?, media: Data) {
         guard let output, let avio else { return (nil, Data()) }
+        try releaseHeldPackets()
         // Drain the interleave queue into movenc first.
         try FFmpegError.check(av_interleaved_write_frame(output, nil), "flush interleave queue")
 
@@ -285,6 +380,7 @@ final class FMP4SegmentWriter {
     /// Write the trailer and return any final bytes.
     func finish() throws -> Data {
         guard let output, let avio else { return Data() }
+        try releaseHeldPackets()
         try FFmpegError.check(av_write_trailer(output), "av_write_trailer")
         avio_flush(avio)
         let tail = takeBufferedBytes()
