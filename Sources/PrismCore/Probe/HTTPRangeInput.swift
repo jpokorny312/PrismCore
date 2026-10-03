@@ -221,7 +221,7 @@ final class HTTPRangeInput {
                 // exist — the transfer error is the whole evidence, and it
                 // rides along in `underlying`.
                 latch(.originUnreachable(status: nil, url: url, underlying: response.error))
-                HTTPOriginCoordinator.shared.refuse(origin, retryAfter: "0.25")
+                HTTPOriginCoordinator.shared.refuse(origin, retryAfter: "0.25", throttled: false)
                 HTTPOriginCoordinator.shared.release(origin)
                 continue
             }
@@ -291,6 +291,7 @@ final class HTTPRangeInput {
             // that was throttled at minute one and dies of something else at
             // minute forty would otherwise be reported as rate-limited.
             latch(nil)
+            HTTPOriginCoordinator.shared.succeeded(origin)
             return
         }
         throw Failure.request

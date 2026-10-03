@@ -120,13 +120,34 @@ enum ServeCommand {
         // Once the URL is out, Ctrl-C is how a serve is *meant* to end, so it
         // exits 0; before that it interrupted a startup, and exits 130.
         let stop = StopSignal(watchStdin: true)
-        return try await withServedSession(reader.options, stop: stop) { playlist in
+        return try await withServedSession(reader.options, stop: stop, beforeStart: { session in
+            // Registered before `start()` so a throttle during the opening
+            // reads is printed too; the stream ends with the session.
+            let events = await session.playbackEvents()
+            Task { for await event in events { print("event: \(describe(event))") } }
+        }) { playlist in
             print("serving: \(playlist.absoluteString)")
             print("open it in Safari or QuickTime Player; Enter or Ctrl-C stops the session")
             // Timed stops count from the URL being out, not from launch.
             if let duration { stop.fire(after: duration, "--for elapsed") }
             print("stopping (\(await stop.wait() ?? "cancelled"))")
             return .ok
+        }
+    }
+
+    static func describe(_ event: PlaybackEvent) -> String {
+        func seconds(_ duration: Duration) -> String {
+            String(format: "%.1fs", duration / .seconds(1))
+        }
+        switch event {
+        case .slowServe(let path, let waited): return "slow serve \(path) after \(seconds(waited))"
+        case .serveTimedOut(let path): return "serve timed out \(path)"
+        case .producerStalled(let since, let lastPTS):
+            return "producer stalled for \(seconds(since))"
+                + (lastPTS.map { String(format: ", last packet at %.3fs", $0) } ?? ", no packet read yet")
+        case .originThrottled(let retryAfter):
+            return "origin throttled" + (retryAfter.map { ", retry after \(seconds($0))" } ?? "")
+        case .originRecovered: return "origin recovered"
         }
     }
 }
@@ -221,10 +242,13 @@ enum SegVerifyCommand {
             }
         }
         let report: SegmentVerifier.Report
+        var repairs: TimestampRepairStats?
         if alreadyHLS {
             report = try await verify(options.source!)
         } else {
-            report = try await withServedSession(options, stop: stop, verify)
+            report = try await withServedSession(
+                options, stop: stop, beforeStop: { repairs = await $0.timestampRepairs }, verify
+            )
         }
 
         print("")
@@ -238,8 +262,18 @@ enum SegVerifyCommand {
                         ? "" : "; NOT decoded: " + playlist.undecodedStreams.joined(separator: ", ")))
             }
         }
+        if !alreadyHLS { print(render(repairs)) }
         for finding in report.findings { print(finding) }
         return summarize(report)
+    }
+
+    /// A remux that repaired nothing says so: the line's absence would read
+    /// the same as a build that never checked.
+    static func render(_ repairs: TimestampRepairStats?) -> String {
+        guard let repairs else { return "timestamp repairs: none" }
+        return "timestamp repairs: \(repairs.missingDTSFilled) missing DTS filled, "
+            + "\(repairs.nonMonotonicDTSBumped) DTS bumped forward, "
+            + "\(repairs.ptsRaisedToDTS) PTS raised to DTS"
     }
 
     /// The last line and the exit status. A problem found outranks a check

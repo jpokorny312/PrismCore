@@ -234,6 +234,22 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// video keyframe, but "in practice" is not an ordering guarantee.
     private var preOriginCues: [(streamIndex: Int32, cue: SubtitleCue)] = []
     private var timelineOriginSeconds: Double = 0
+    /// Kept apart from the origin, and the cues it shifts are stored
+    /// unshifted: the origin is a fact about the output (3.2.5 had to pin it
+    /// to the plan across an early re-anchor), the delay is the viewer's
+    /// correction on top of it, and a replay must apply the delay in force
+    /// NOW rather than whichever one was in force when the cue was produced.
+    private var storedDelaySeconds: Double = 0
+
+    /// The subtitle offset in force, in seconds (see `setDelay`).
+    var delaySeconds: Double { lock.withLock { storedDelaySeconds } }
+
+    /// Cues reach the host from here on with the new offset; renditions take
+    /// it at their next `flushSegment`. Nothing already handed out — a
+    /// delivered cue, a `.vtt` on disk — is rewritten.
+    func setDelay(_ seconds: Double) {
+        lock.withLock { storedDelaySeconds = SubtitleDelay.normalized(seconds) }
+    }
 
     init(outputDirectory: URL) {
         self.outputDirectory = outputDirectory
@@ -573,8 +589,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         lock.withLock {
             timelineOriginSeconds = max(0, seconds)
             for pending in preOriginCues {
-                if let rebased = rebasedLocked(streamIndex: pending.streamIndex, pending.cue) {
-                    toDeliver.append(rebased)
+                if let rebased = rebasedLocked(streamIndex: pending.streamIndex, pending.cue),
+                   let delayed = rebased.delayed(by: storedDelaySeconds) {
+                    toDeliver.append(delayed)
                 }
             }
             preOriginCues = []
@@ -593,7 +610,7 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     func setCueHandler(_ handler: (@Sendable (TimedTextCue) -> Void)?) {
         let replay: [TimedTextCue] = lock.withLock {
             cueHandler = handler
-            return handler != nil ? emittedCues : []
+            return handler != nil ? emittedCues.compactMap { $0.delayed(by: storedDelaySeconds) } : []
         }
         guard let handler else { return }
         for cue in replay { handler(cue) }
@@ -609,7 +626,7 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                 preOriginCues.append((streamIndex, cue))
                 return
             }
-            toDeliver = rebasedLocked(streamIndex: streamIndex, cue)
+            toDeliver = rebasedLocked(streamIndex: streamIndex, cue)?.delayed(by: storedDelaySeconds)
             handler = cueHandler
         }
         if let handler, let toDeliver { handler(toDeliver) }
@@ -730,6 +747,7 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         // become a cue up to the boundary, or the segment that was showing it
         // ships without it.
         if let captionReader { deliver(captionReader.advance(to: end)) }
+        let delay = delaySeconds
         for track in tracks {
             // An open bitmap cue splits at the boundary: its first part is
             // written into this segment, its tail re-opens into the next —
@@ -749,7 +767,7 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                     track.writer.add(head)
                 }
             }
-            try track.writer.flushSegment(start: start, end: end)
+            try track.writer.flushSegment(start: start, end: end, delaySeconds: delay)
         }
     }
 

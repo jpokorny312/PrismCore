@@ -92,6 +92,42 @@ struct SoftwareSubtitleSelectionTests {
         #expect(!select(pipeline, 2))
     }
 
+    @Test("A subtitle delay shifts which cue is active and its times, with no flush")
+    func subtitleDelayShiftsActiveCues() throws {
+        let video = RecordingVideoSink()
+        let audio = RecordingAudioSink()
+        let timeline = RecordingTimeline()
+        let pipeline = SoftwarePlaybackPipeline(videoSink: video, audioSink: audio,
+            timeline: timeline, allowHardwareDecode: false)
+        let url = try #require(Bundle.module.url(forResource: "h264_aac_forced_subs",
+            withExtension: "mkv", subdirectory: "Fixtures"))
+        try pipeline.load(probed: SourceProbe.open(url: url))
+        defer { pipeline.stop() }
+        pipeline.waitForFeedQueue()
+        for _ in 0..<6 { video.playOut(); audio.playOut() }
+        timeline.setRate(0, time: CMTime(seconds: 2.5, preferredTimescale: 1_000))
+        #expect(select(pipeline, 2))
+        let cue = try #require(pipeline.activeSubtitleCues.first)
+
+        // Pick a delay that puts the playhead on the cue's midpoint on the
+        // source axis: it must still be the active one, carrying shifted times.
+        let delay = 2.5 - (cue.start + cue.end) / 2
+        pipeline.setSubtitleDelaySeconds(delay)
+        let shifted = try #require(pipeline.activeSubtitleCues.first)
+        #expect(shifted.text == cue.text)
+        #expect(abs(shifted.start - max(0, cue.start + delay)) < 0.000_1)
+        #expect(abs(shifted.end - (cue.end + delay)) < 0.000_1)
+        #expect(video.flushes.isEmpty)
+        #expect(audio.flushCount == 0)
+
+        pipeline.setSubtitleDelaySeconds(99)
+        #expect(pipeline.subtitleDelaySeconds == 10)
+        #expect(pipeline.activeSubtitleCues.isEmpty)
+        pipeline.setSubtitleDelaySeconds(.nan)
+        #expect(pipeline.subtitleDelaySeconds == 0)
+        #expect(pipeline.activeSubtitleCues == [cue])
+    }
+
     @Test("Cue cache preserves source timestamps and overlapping cues, deduplicates rewinds and bounds memory")
     func subtitleCacheBoundsAndTimeline() {
         let store = SoftwareSubtitleCueStore(maximumCues: 3, maximumBytes: 12)

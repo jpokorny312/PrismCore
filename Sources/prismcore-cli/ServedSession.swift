@@ -17,10 +17,16 @@ import PrismCore
 /// `afterProbe` runs between the two, and exists for the tests: it is the
 /// one moment a test can make the origin stall `start()` without stalling
 /// the probe too.
+///
+/// `beforeStop` runs after `body` succeeds, while the session is still
+/// alive: what the remux learned on the way (its repair counts) is read from
+/// the session, and a stopped one has nothing left to ask.
 func withServedSession<T>(
     _ options: SourceOptions,
     stop: StopSignal,
     afterProbe: () -> Void = {},
+    beforeStart: (PrismCoreSession) async -> Void = { _ in },
+    beforeStop: (PrismCoreSession) async -> Void = { _ in },
     _ body: (URL) async throws -> T
 ) async throws -> T {
     let (probed, decision) = try await untilStopped(stop) { try await probeAndRoute(options) }
@@ -42,6 +48,7 @@ func withServedSession<T>(
         probed: probed,
         coordinatedHTTP: options.coordinatedHTTP
     )
+    await beforeStart(session)
     let playlist: URL
     do {
         playlist = try await untilStopped(stop) { try await session.start() }
@@ -57,6 +64,7 @@ func withServedSession<T>(
     }
     do {
         let result = try await body(playlist)
+        await beforeStop(session)
         await session.stop()
         return result
     } catch {

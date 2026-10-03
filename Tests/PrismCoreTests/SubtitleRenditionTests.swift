@@ -279,6 +279,82 @@ struct SubtitleRenditionTests {
         #expect(abs(last.end - 7.9) < 0.001)
     }
 
+    @Test("A subtitle delay rides on the plan's origin across an early re-anchor")
+    func cueTapDelaySurvivesEarlyReanchor() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PrismCoreEarlyAnchorDelay-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Same race as `cueTapOriginSurvivesEarlyReanchor`, with a delay in
+        // force: had the delay replaced the origin (or been folded into it at
+        // the anchor), "Konec" would land relative to the 6 s keyframe, not at
+        // its plan time plus the delay.
+        let demand = DemandCoordinator()
+        let remuxer = HLSRemuxer(
+            sourceURL: try fixture("h264_aac_srt.mkv"),
+            outputDirectory: directory,
+            segmentSeconds: 2,
+            demand: demand
+        )
+        remuxer.subtitles.setDelay(0.5)
+        let collector = CueCollector()
+        remuxer.subtitles.setCueHandler { collector.append($0) }
+        demand.requestProduction(of: 3)
+        let producer = ProducerThread(name: "prismcore.tests.early-anchor-delay") { try remuxer.run() }
+        defer { remuxer.cancel(); Task { await producer.join() } }
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(20))
+        while ContinuousClock.now < deadline, !collector.cues.contains(where: { $0.text.contains("Konec") }) {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let last = try #require(collector.cues.first { $0.text.contains("Konec") })
+        #expect(abs(last.start - 7.5) < 0.001)
+        #expect(abs(last.end - 8.4) < 0.001)
+    }
+
+    @Test("The subtitle delay reaches new WebVTT segments and the cue tap, never below zero")
+    func subtitleDelayShiftsRenditionAndCueTap() async throws {
+        let session = try PrismCoreSession(url: try fixture("h264_aac_srt.mkv"))
+        // Clamp and sanitising, before anything is produced.
+        #expect(await session.setSubtitleDelaySeconds(99) == .inForce)
+        #expect(await session.subtitleDelaySeconds == 10)
+        #expect(await session.setSubtitleDelaySeconds(.nan) == .inForce)
+        #expect(await session.subtitleDelaySeconds == 0)
+        #expect(await session.setSubtitleDelaySeconds(1.5) == .inForce)
+
+        let playlist = try await session.start()
+        defer { Task { await session.stop() } }
+        try await waitForFinishedPlaylist(playlist)
+
+        // Origin 0 plus 1.5 s on the 90 kHz axis; the printed times are left
+        // alone, so the segment a cue lands in does not move.
+        let base = playlist.deletingLastPathComponent()
+        let (segment, _) = try await fetch(base.appendingPathComponent("subs0/seg00000.vtt"))
+        #expect(segment.contains("X-TIMESTAMP-MAP=MPEGTS:135000,LOCAL:00:00:00.000"))
+
+        let shifted = CueCollector()
+        await session.setTimedTextCueHandler { shifted.append($0) }
+        let first = try #require(shifted.cues.first)
+        #expect(first.start == 2.5)
+        #expect(first.end == 4.5)
+
+        // Mid-playback the change is honest about the buffered rendition, and
+        // the tap replays with the delay in force NOW. 1–3 s pulled back 2 s
+        // clamps its start at zero instead of going negative.
+        #expect(await session.setSubtitleDelaySeconds(-2) == .appliesToNewSegments)
+        let pulled = CueCollector()
+        await session.setTimedTextCueHandler { pulled.append($0) }
+        let early = try #require(pulled.cues.first)
+        #expect(early.start == 0)
+        #expect(early.end == 1.0)
+        #expect(pulled.cues.allSatisfy { $0.start >= 0 && $0.end > $0.start })
+
+        await session.stop()
+        #expect(await session.setSubtitleDelaySeconds(1) == .sessionStopped)
+        #expect(await session.subtitleDelaySeconds == -2)
+    }
+
     // MARK: - Master playlist rules
 
     @Test("Renditions are never DEFAULT or AUTOSELECT — the host selects them")

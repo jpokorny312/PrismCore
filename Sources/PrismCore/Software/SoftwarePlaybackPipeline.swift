@@ -215,9 +215,29 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
     /// Times use the source axis, like this pipeline's clock. Text is WebVTT
     /// payload with optional inline tags, not an attributed string. Reading this
     /// never waits for demux I/O. Cues expire even when no more packets arrive.
+    /// Already shifted by `subtitleDelaySeconds`.
     public var activeSubtitleCues: [TimedTextCue] {
         guard let index = selectedSubtitleStreamIndex else { return [] }
-        return subtitleCues.active(streamIndex: index, at: CMTimeGetSeconds(currentTime))
+        let delay = subtitleDelaySeconds
+        return subtitleCues.active(streamIndex: index, at: CMTimeGetSeconds(currentTime) - delay)
+            .compactMap { $0.delayed(by: delay) }
+    }
+
+    /// The offset `activeSubtitleCues` is shifted by, in seconds. Positive
+    /// values show text later. Range: -10...10 seconds.
+    public var subtitleDelaySeconds: Double { stateLock.withLock { storedSubtitleDelaySeconds } }
+
+    /// Shift subtitle text against the picture. Unlike the audio offset this
+    /// needs no flush: the store keeps cues on the source axis and the shift
+    /// is applied when they are read, so the next `activeSubtitleCues` poll
+    /// already carries it. A non-finite value becomes zero.
+    ///
+    /// A negative offset shows a cue before the demuxer's look-ahead may have
+    /// reached it; text further ahead than that appears late until the feed
+    /// catches up.
+    public func setSubtitleDelaySeconds(_ seconds: Double) {
+        let value = SubtitleDelay.normalized(seconds)
+        stateLock.withLock { storedSubtitleDelaySeconds = value }
     }
 
     /// Select embedded text or `nil` for Off. Conversion runs as packets arrive
@@ -260,6 +280,7 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
 
     private let stateLock = NSLock()
     private var storedAudioDelaySeconds: Double = 0
+    private var storedSubtitleDelaySeconds: Double = 0
     private var storedState: State = .idle
     private var storedDurationSeconds: Double?
     private var storedSourceInfo: SourceInfo?
@@ -1329,7 +1350,10 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
         if let stream = input.pointee.streams[Int(packet.pointee.stream_index)],
            let kind = SubtitleRenditionSet.kind(for: stream.pointee.codecpar.pointee.codec_id) {
             subtitleCues.ingest(packet, timeBase: stream.pointee.time_base, kind: kind,
-                                currentTime: clockAnchored ? CMTimeGetSeconds(timeline.currentTime) : .nan,
+                                // On the source axis the store prunes on: a delayed cue
+                                // is still on screen until its end plus the delay.
+                                currentTime: clockAnchored
+                                    ? CMTimeGetSeconds(timeline.currentTime) - subtitleDelaySeconds : .nan,
                                 playResolution: SubtitleRenditionSet.playResolution(of: stream.pointee.codecpar, kind: kind))
         }
 

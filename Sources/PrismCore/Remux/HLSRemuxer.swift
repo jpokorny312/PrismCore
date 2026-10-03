@@ -375,17 +375,67 @@ final class HLSRemuxer: @unchecked Sendable {
         return sourceBytesReadStorage
     }
 
-    private func countSourceBytes(_ bytes: Int32) {
-        guard bytes > 0 else { return }
+    private func countSourceBytes(_ bytes: Int32, ptsSeconds: Double?) {
+        let now = ProcessInfo.processInfo.systemUptime
         sourceBytesLock.lock()
-        sourceBytesReadStorage &+= Int64(bytes)
+        if bytes > 0 { sourceBytesReadStorage &+= Int64(bytes) }
+        // Stamped under the byte counter's lock, which the packet already
+        // pays for: a second lock per packet would buy the watchdog nothing.
+        lastReadUptime = now
+        if let ptsSeconds { lastReadPTS = ptsSeconds }
         sourceBytesLock.unlock()
+    }
+
+    // The stall watchdog's view of the copy loop, under `sourceBytesLock`.
+    private var lastReadUptime: TimeInterval = 0
+    private var lastReadPTS: Double?
+    /// Parked on purpose (lead full, EOF waiting for demand) or no longer
+    /// running. Without it a paused player — which parks the producer while
+    /// AVPlayer still holds a request open — would read as a stall.
+    private var producerIdle = false
+    private var reportedStallEpoch: TimeInterval = -1
+
+    private func setProducerIdle(_ idle: Bool) {
+        let now = ProcessInfo.processInfo.systemUptime
+        sourceBytesLock.withLock {
+            producerIdle = idle
+            // Leaving a park is progress: the stall clock starts from here,
+            // not from the last packet before a ten-minute pause.
+            if !idle { lastReadUptime = now }
+        }
+    }
+
+    private func idle<T>(_ body: () -> T) -> T {
+        setProducerIdle(true)
+        defer { setProducerIdle(false) }
+        return body()
+    }
+
+    /// For a serve that has been waiting since `waitingSince` (uptime): a
+    /// `.producerStalled` once the copy loop has read nothing for `threshold`
+    /// of that wait. Once per stall, however many serves are waiting on it —
+    /// AVPlayer holds video and audio requests open together.
+    func stallReport(waitingSince: TimeInterval, threshold: TimeInterval) -> PlaybackEvent? {
+        let now = ProcessInfo.processInfo.systemUptime
+        return sourceBytesLock.withLock {
+            guard !producerIdle, reportedStallEpoch != lastReadUptime else { return nil }
+            let since = now - max(lastReadUptime, waitingSince)
+            guard since >= threshold else { return nil }
+            reportedStallEpoch = lastReadUptime
+            return .producerStalled(since: .seconds(since), lastPTS: lastReadPTS)
+        }
     }
     private var storedConversionStats: DolbyVisionConversionStats?
 
     var dolbyVisionConversionStats: DolbyVisionConversionStats? {
         conversionStatsLock.withLock { storedConversionStats }
     }
+
+    /// Shared by every writer this remux builds, the renditions' included:
+    /// writers are rebuilt on each re-anchor, the session's count is not.
+    let timestampRepairLedger = TimestampRepairLedger()
+
+    var timestampRepairStats: TimestampRepairStats? { timestampRepairLedger.stats }
 
     /// Frames a JOC walk may read before "no JOC" is the answer. Shared by both
     /// output shapes so a source's verdict can't depend on which one carried it.
@@ -545,6 +595,9 @@ final class HLSRemuxer: @unchecked Sendable {
     /// long as production takes and parks at EOF for the length of the session.
     /// Returns normally on EOF or cancellation, throws on setup/write failures.
     func run() throws {
+        // A producer that has finished (or died) makes no progress by design;
+        // its error, if any, is the host's signal, not a stall report.
+        defer { setProducerIdle(true) }
         var input: UnsafeMutablePointer<AVFormatContext>?
 
         // Adopt the routing probe's context when the host handed one over —
@@ -1027,6 +1080,7 @@ final class HLSRemuxer: @unchecked Sendable {
                 }
                 do {
                     rendition.audioDelaySeconds = audioDelaySeconds
+                    rendition.timestampRepairs = timestampRepairLedger
                     try rendition.open(input: input)
                     renditions.append(rendition)
                     audioDeliveryStore.update(index: Int(route.index),
@@ -1083,6 +1137,7 @@ final class HLSRemuxer: @unchecked Sendable {
                 }
                 do {
                     rendition.audioDelaySeconds = audioDelaySeconds
+                    rendition.timestampRepairs = timestampRepairLedger
                     try rendition.open(input: input)
                     renditions.append(rendition)
                 } catch {
@@ -1184,6 +1239,7 @@ final class HLSRemuxer: @unchecked Sendable {
 
         var writer = FMP4SegmentWriter()
         writer.audioDelaySeconds = audioDelaySeconds
+        writer.timestampRepairs = timestampRepairLedger
         _ = try writer.open(input: input, plan: plan)   // delay_moov: header emits nothing
         var streamMap = writer.streamMap
         let playlist = MediaPlaylistWriter(directory: outputDirectory)
@@ -1497,6 +1553,7 @@ final class HLSRemuxer: @unchecked Sendable {
             }
             writer = FMP4SegmentWriter()
             writer.audioDelaySeconds = audioDelaySeconds
+            writer.timestampRepairs = timestampRepairLedger
             _ = try writer.open(input: input, plan: plan, restart: true)
             streamMap = writer.streamMap
             for rendition in renditions {
@@ -1578,7 +1635,13 @@ final class HLSRemuxer: @unchecked Sendable {
                         ?? interruptGuard.originFailure
                         ?? FFmpegError(code: readResult, operation: "av_read_frame")
                 }
-                countSourceBytes(packet.pointee.size)
+                let readTimeBase = input.pointee.streams[Int(packet.pointee.stream_index)]!.pointee.time_base
+                countSourceBytes(
+                    packet.pointee.size,
+                    ptsSeconds: packet.pointee.pts == swift_AV_NOPTS_VALUE() || readTimeBase.den == 0
+                        ? nil
+                        : Double(packet.pointee.pts) * Double(readTimeBase.num) / Double(readTimeBase.den)
+                )
                 defer { av_packet_unref(packet) }
 
                 // A fetch outside the producer's window re-anchors it — checked
@@ -1670,10 +1733,12 @@ final class HLSRemuxer: @unchecked Sendable {
                                 // when the viewer reaches the end, the gain
                                 // is not demuxing and writing the whole film
                                 // while they are on minute two.
-                                demand?.parkWhileAhead(
-                                    producing: segmentIndex,
-                                    isCancelled: { [cancelled] in cancelled.isSet }
-                                )
+                                idle {
+                                    demand?.parkWhileAhead(
+                                        producing: segmentIndex,
+                                        isCancelled: { [cancelled] in cancelled.isSet }
+                                    )
+                                }
                                 segmentStartPTS = pts
                                 nextBoundaryPTS = plannedPlan != nil
                                     ? plannedBoundary(after: segmentIndex)
@@ -1896,7 +1961,7 @@ final class HLSRemuxer: @unchecked Sendable {
                 // signals it, so the hop costs nothing at all, and a parked
                 // producer stops burning a thread's worth of wakeups for the
                 // length of a film (#44).
-                demand?.waitForAnchorRequest(isCancelled: { [cancelled] in cancelled.isSet })
+                idle { demand?.waitForAnchorRequest(isCancelled: { [cancelled] in cancelled.isSet }) }
             }
             guard let anchor = idleAnchor else { break produce }
             try reanchor(to: anchor)

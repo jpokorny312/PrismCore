@@ -199,6 +199,53 @@ struct SubtitleConversionTests {
         #expect(segment.contains("00:00:01.000 --> 00:00:02.000\none second in"))
     }
 
+    @Test("A delay changes the map of segments written after it, on top of the origin")
+    func delayShiftsTimestampMapOfNewSegments() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let writer = try WebVTTRenditionWriter(directory: root.appendingPathComponent("subs0"))
+        writer.setTimelineOrigin(seconds: 10)
+        writer.add(SubtitleCue(start: 11, end: 12, text: "before"))
+        writer.add(SubtitleCue(start: 17, end: 18, text: "after"))
+        try writer.flushSegment(start: 10, end: 16)
+        try writer.flushSegment(start: 16, end: 22, delaySeconds: 2)
+
+        let first = try String(contentsOf: root.appendingPathComponent("subs0/seg00000.vtt"), encoding: .utf8)
+        let second = try String(contentsOf: root.appendingPathComponent("subs0/seg00001.vtt"), encoding: .utf8)
+        #expect(first.contains("X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000"))
+        #expect(second.contains("X-TIMESTAMP-MAP=MPEGTS:1080000,LOCAL:00:00:00.000"))
+        #expect(second.contains("00:00:07.000 --> 00:00:08.000\nafter"))
+    }
+
+    @Test("A negative delay past the origin moves the printed times, never below zero")
+    func negativeDelayNeverUnderflows() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let writer = try WebVTTRenditionWriter(directory: root.appendingPathComponent("subs0"))
+        writer.add(SubtitleCue(start: 1, end: 2, text: "gone"))
+        writer.add(SubtitleCue(start: 2, end: 4, text: "clamped"))
+        writer.add(SubtitleCue(start: 4, end: 5, text: "moved"))
+        try writer.flushSegment(start: 0, end: 6, delaySeconds: -3)
+
+        let segment = try String(contentsOf: root.appendingPathComponent("subs0/seg00000.vtt"), encoding: .utf8)
+        #expect(segment.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"))
+        #expect(!segment.contains("gone"))
+        #expect(segment.contains("00:00:00.000 --> 00:00:01.000\nclamped"))
+        #expect(segment.contains("00:00:01.000 --> 00:00:02.000\nmoved"))
+    }
+
+    @Test("A shift that empties a cue drops it; an earlier start is clamped at zero")
+    func timedTextCueDelay() {
+        let cue = TimedTextCue(streamIndex: 0, start: 1, end: 3, text: "x")
+        #expect(cue.delayed(by: 0) == cue)
+        #expect(cue.delayed(by: 1.5)?.start == 2.5)
+        #expect(cue.delayed(by: -2)?.start == 0)
+        #expect(cue.delayed(by: -2)?.end == 1)
+        #expect(cue.delayed(by: -3) == nil)
+        #expect(SubtitleDelay.normalized(-42) == -10)
+        #expect(SubtitleDelay.normalized(.infinity) == 0)
+    }
+
     @Test("An empty range still writes a header-only segment, so the counts match")
     func emptySegmentStillWritten() throws {
         let root = try temporaryDirectory()

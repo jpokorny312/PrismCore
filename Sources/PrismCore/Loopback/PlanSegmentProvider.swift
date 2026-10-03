@@ -61,6 +61,17 @@ struct PlanSegmentProvider: SegmentProvider {
     /// segment stays reproducible on demand like any evicted one.
     var isSuperseded: (@Sendable (Int) -> Bool)?
 
+    /// The host's `playbackEvents()` feed; `nil` in tests that build the
+    /// provider bare.
+    var events: PlaybackEventSink?
+    /// The producer's stall verdict for a wait begun at the given uptime,
+    /// past the given threshold (`HLSRemuxer.stallReport`).
+    var stallReport: (@Sendable (_ waitingSince: TimeInterval, _ threshold: TimeInterval) -> PlaybackEvent?)?
+    /// How long a pending serve watches the producer read nothing before it
+    /// says so. Well inside `productionTimeout`, so the host hears the cause
+    /// before AVPlayer reports the symptom.
+    var producerStallThreshold: Duration = .seconds(5)
+
     init(root: URL, coordinator: DemandCoordinator, landed: ProductionSignal? = nil) {
         self.root = root
         self.coordinator = coordinator
@@ -208,6 +219,9 @@ struct PlanSegmentProvider: SegmentProvider {
         // bytes" until the store says the index has been rewritten.
         let isSuperseded = self.isSuperseded
         let supersededIndex = Self.segmentIndex(inPath: path)
+        let events = self.events
+        let stallReport = self.stallReport
+        let stallThreshold = producerStallThreshold / .seconds(1)
         return PendingResult {
             defer {
                 if let servingIndex { coordinator.endServing(index: servingIndex) }
@@ -215,7 +229,10 @@ struct PlanSegmentProvider: SegmentProvider {
             // Clock starts when the SERVE runs, not when the miss was seen —
             // a queued pending must get its full window.
             let deadline = ContinuousClock.now.advanced(by: timeout)
-            while ContinuousClock.now < deadline {
+            let waitingSince = ProcessInfo.processInfo.systemUptime
+            // A cancelled wait is one whose request is gone (seek, abort,
+            // HEAD): the host must not hear a timeout for a file nobody wants.
+            while ContinuousClock.now < deadline, !Task.isCancelled {
                 // Snapshot BEFORE the disk check: a broadcast between the
                 // check and the wait then makes the wait return at once,
                 // instead of being lost to a waiter that was not yet asleep.
@@ -229,6 +246,13 @@ struct PlanSegmentProvider: SegmentProvider {
                 // without this re-check the loop would sleep out the whole
                 // window for a file production has said is not coming.
                 if coordinator.isUnproducible(path: path) { return onTimeout }
+                // Checked on this wait's own wakeups (the backstop poll at
+                // worst), so the watchdog costs nothing while nobody waits and
+                // never touches the producer's or the coordinator's condition.
+                if let events, events.isObserved,
+                   let stalled = stallReport?(waitingSince, stallThreshold) {
+                    events.yield(stalled)
+                }
                 // This wait sits on the SEEK path: a demand fetch is answered
                 // the moment the produced file lands, plus whatever sits
                 // here. It used to be a 10 ms poll, which alone contributed
@@ -241,6 +265,7 @@ struct PlanSegmentProvider: SegmentProvider {
                     try? await Task.sleep(for: Self.backstopPoll)
                 }
             }
+            if !Task.isCancelled { events?.yield(.serveTimedOut(path: path)) }
             return onTimeout
         }
     }

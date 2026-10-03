@@ -34,6 +34,9 @@ final class AudioRenditionWriter {
 
     private var writer = FMP4SegmentWriter()
     var audioDelaySeconds: Double = 0
+    /// The remux's session-wide tally, handed to every writer this rendition
+    /// builds. Set by the remuxer.
+    var timestampRepairs: TimestampRepairLedger?
     /// Planned (demand-driven) mode: the playlist was written complete
     /// upfront from the segment plan — cuts write FILES only.
     private var plannedMode = false
@@ -189,6 +192,7 @@ final class AudioRenditionWriter {
     /// part of `open` a re-anchor repeats.
     private func openMuxer(input: UnsafeMutablePointer<AVFormatContext>, restart: Bool) throws {
         writer.audioDelaySeconds = audioDelaySeconds
+        writer.timestampRepairs = timestampRepairs
         let index = Int32(track.streamIndex)
         let plan: FMP4SegmentWriter.StreamPlan
         if let bridge {

@@ -44,3 +44,27 @@ public struct TimedTextCue: Sendable, Equatable {
         self.placement = placement
     }
 }
+
+enum SubtitleDelay {
+    /// Wider than audio's +/-2 s: a lip-sync error is a few frames, while a
+    /// subtitle file cut for another release (PAL speed-up, a different
+    /// intro) is routinely several seconds out.
+    static func normalized(_ value: Double) -> Double {
+        value.isFinite ? min(10, max(-10, value)) : 0
+    }
+}
+
+extension TimedTextCue {
+    /// The cue as the viewer should see it under `delay`, or `nil` when the
+    /// shift pushes it wholly before zero. The start is clamped rather than
+    /// allowed negative: a negative cue time is the same trap an unsigned
+    /// timestamp is on the audio side, and every consumer compares against a
+    /// clock that never goes below zero anyway.
+    func delayed(by delay: Double) -> TimedTextCue? {
+        guard delay != 0 else { return self }
+        let start = Swift.max(0, self.start + delay)
+        let end = self.end + delay
+        guard end > start else { return nil }
+        return TimedTextCue(streamIndex: streamIndex, start: start, end: end, text: text, placement: placement)
+    }
+}

@@ -32,6 +32,14 @@ final class FMP4SegmentWriter {
     private var avio: UnsafeMutablePointer<AVIOContext>?
     private let sink = Sink()
     var audioDelaySeconds: Double = 0
+    /// Where this writer's timestamp repairs are tallied; outlives the writer.
+    var timestampRepairs: TimestampRepairLedger?
+    /// One per output stream, created on its first packet. Owned by the writer
+    /// so that a re-anchor, which always builds a fresh writer, starts every
+    /// stream over: the restarted fragment's tfdt carries absolute time, and a
+    /// sanitizer still holding the old position's last DTS would clamp the
+    /// first packets after a backward seek up to it.
+    private var sanitizers: [Int: TimestampSanitizer] = [:]
     private var ioBuffer: UnsafeMutableRawPointer?
 
     /// input stream index → output stream index
@@ -205,9 +213,23 @@ final class FMP4SegmentWriter {
 
     var context: UnsafeMutablePointer<AVFormatContext>? { output }
 
+    /// Mux one packet, already rescaled onto its output stream's time base.
+    ///
+    /// Every stream-copied and bridged packet of both output shapes comes
+    /// through here, which is why the timestamp repair lives here and not in
+    /// each caller: a path that skipped it would fail the whole remux on the
+    /// first bad DTS.
     func write(_ packet: UnsafeMutablePointer<AVPacket>) throws {
         guard let output else { return }
         let index = Int(packet.pointee.stream_index)
+        if index >= 0, index < Int(output.pointee.nb_streams), let stream = output.pointee.streams[index] {
+            // Before the audio delay shift, so the delay's drop-below-zero
+            // check sees timestamps the muxer would accept.
+            var sanitizer = sanitizers[index]
+                ?? TimestampSanitizer(reordersFrames: stream.pointee.codecpar.pointee.video_delay > 0)
+            sanitizer.sanitize(packet, recordingInto: timestampRepairs)
+            sanitizers[index] = sanitizer
+        }
         if audioDelaySeconds != 0, index >= 0, index < Int(output.pointee.nb_streams),
            let stream = output.pointee.streams[index],
            stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO {

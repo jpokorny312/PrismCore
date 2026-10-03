@@ -12,6 +12,59 @@ final class HTTPOriginCoordinator: @unchecked Sendable {
     }
     private let condition = NSCondition()
     private var states: [String: State] = [:]
+    /// Kept apart from `states`, which forgets a refused origin a minute
+    /// later: a recovery has to be reported however long the throttle lasted.
+    private var throttled: Set<String> = []
+    private var observers: [UUID: (origin: String, handler: @Sendable (PlaybackEvent) -> Void)] = [:]
+    /// Two fills share an origin, so a 429 and a 206 can cross: without one
+    /// order for "decide and deliver", a throttle decided first could land
+    /// after the recovery that ended it, and the host would sit on
+    /// "overloaded" with nothing left to clear it. Separate from `condition`
+    /// so admission never waits behind a handler.
+    private let emitLock = NSLock()
+
+    /// Holds a session's subscription; dropping it unsubscribes, so a session
+    /// a host forgot to `stop()` does not leave a handler behind forever.
+    final class Observation: Sendable {
+        private let id: UUID
+        private let coordinator: HTTPOriginCoordinator
+        fileprivate init(id: UUID, coordinator: HTTPOriginCoordinator) {
+            self.id = id
+            self.coordinator = coordinator
+        }
+        deinit { coordinator.withLock { coordinator.observers.removeValue(forKey: id) } }
+    }
+
+    /// Per-session events for `origin`. The coordinator is process-wide, so
+    /// every session on that origin is told — they all share its admission.
+    func observe(_ origin: String, _ handler: @escaping @Sendable (PlaybackEvent) -> Void) -> Observation {
+        let id = UUID()
+        withLock { observers[id] = (origin, handler) }
+        return Observation(id: id, coordinator: self)
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        condition.lock()
+        defer { condition.unlock() }
+        return body()
+    }
+
+    /// Called with the lock NOT held: a handler that took long, or called back
+    /// in, must not stall admission for every reader of every origin.
+    private func notify(_ origin: String, _ event: PlaybackEvent) {
+        let handlers = withLock { observers.values.filter { $0.origin == origin }.map(\.handler) }
+        for handler in handlers { handler(event) }
+    }
+
+    /// A response that is not a refusal. This, not admission, ends a
+    /// throttle: `acquire` admits as soon as the backoff expires, and the
+    /// answer to that request may well be the next 429.
+    func succeeded(_ origin: String) {
+        emitLock.withLock {
+            guard withLock({ throttled.remove(origin) != nil }) else { return }
+            notify(origin, .originRecovered)
+        }
+    }
 
     static func origin(_ url: URL) -> String {
         "\(url.scheme?.lowercased() ?? "")://\(url.host?.lowercased() ?? ""):\(url.port ?? (url.scheme == "https" ? 443 : 80))"
@@ -80,8 +133,12 @@ final class HTTPOriginCoordinator: @unchecked Sendable {
         condition.unlock()
     }
 
-    func refuse(_ origin: String, retryAfter: String?) {
+    /// - Parameter throttled: `false` for a transport failure backed off the
+    ///   same way. Telling a host "the server is overloaded" about a dropped
+    ///   socket would send it looking in the wrong place.
+    func refuse(_ origin: String, retryAfter: String?, throttled isThrottle: Bool = true) {
         condition.lock()
+        if isThrottle { throttled.insert(origin) }
         var state = states[origin] ?? State()
         state.refusals = min(4, state.refusals + 1)
         state.lastRefusal = ProcessInfo.processInfo.systemUptime
@@ -91,6 +148,15 @@ final class HTTPOriginCoordinator: @unchecked Sendable {
         states[origin] = state
         condition.broadcast()
         condition.unlock()
+        if isThrottle {
+            let event = PlaybackEvent.originThrottled(retryAfter: Self.retryDelay(retryAfter).map { .seconds($0) })
+            emitLock.withLock {
+                // A success that crossed this refusal has already cleared and
+                // reported it; a throttle sent now would be the last word.
+                guard withLock({ throttled.contains(origin) }) else { return }
+                notify(origin, event)
+            }
+        }
     }
 
     static func retryDelay(_ header: String?, now: Date = Date()) -> TimeInterval? {

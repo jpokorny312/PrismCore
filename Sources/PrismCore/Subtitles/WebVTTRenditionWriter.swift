@@ -61,8 +61,18 @@ final class WebVTTRenditionWriter {
     }
 
     /// `MPEGTS` value paired with `LOCAL:00:00:00.000`, on the 90 kHz axis.
-    var mpegtsOffset: Int64 {
-        Int64((originSeconds * 90_000).rounded())
+    ///
+    /// A subtitle delay rides here, on top of the origin and never instead of
+    /// it, so the cue text and the segment a cue lands in stay exactly what
+    /// they were without one. Floored at zero: the map is an unsigned 33-bit
+    /// PTS, and a negative delay larger than the origin has to move the cue
+    /// times instead (see `flushSegment`).
+    func mpegtsOffset(delaySeconds: Double = 0) -> Int64 {
+        Int64((mapSeconds(delaySeconds: delaySeconds) * 90_000).rounded())
+    }
+
+    private func mapSeconds(delaySeconds: Double) -> Double {
+        max(0, originSeconds + delaySeconds)
     }
 
     func add(_ cue: SubtitleCue) {
@@ -95,8 +105,13 @@ final class WebVTTRenditionWriter {
         pending.removeAll { $0.end <= startSeconds }
     }
 
-    func flushSegment(start: Double, end: Double) throws {
+    func flushSegment(start: Double, end: Double, delaySeconds: Double = 0) throws {
         let range = start...max(start, end)
+        // What the map cannot carry (a negative delay past the origin) is
+        // taken off the printed times, clamped at zero: WebVTT has no
+        // negative timestamp, and a cue pushed wholly before the film starts
+        // is simply gone.
+        let local = mapSeconds(delaySeconds: delaySeconds) - delaySeconds
         let inRange = pending
             .filter { $0.start < range.upperBound && $0.end > range.lowerBound }
             .map { $0.clamped(to: range) }
@@ -106,13 +121,14 @@ final class WebVTTRenditionWriter {
             // origin itself back onto the media axis.
             .map { cue in
                 var rebased = cue
-                rebased.start -= originSeconds
-                rebased.end -= originSeconds
+                rebased.start = max(0, rebased.start - local)
+                rebased.end -= local
                 return rebased
             }
+            .filter { $0.end > $0.start }
 
         let file = String(format: "seg%05d.vtt", segmentIndex)
-        try Data(Self.render(cues: inRange, mpegtsOffset: mpegtsOffset).utf8)
+        try Data(Self.render(cues: inRange, mpegtsOffset: mpegtsOffset(delaySeconds: delaySeconds)).utf8)
             .write(to: directory.appendingPathComponent(file), options: .atomic)
         if !plannedMode {
             try playlist.appendSegment(duration: max(0.001, end - start), file: file)

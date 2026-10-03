@@ -24,7 +24,7 @@ struct PrismCoreCLI {
         Commands:
           probe      SourceInfo, container structure, and the routing verdict with its reason
           serve      start a remux session and print its loopback playlist URL; runs
-                     until Enter or Ctrl-C (or --for SECONDS)
+                     until Enter or Ctrl-C (or --for SECONDS), printing playback events
           validate   serve, then run Apple's mediastreamvalidator (and hlsreport) over the
                      produced HLS. Opt-in: needs Apple's HTTP Live Streaming Tools
           bench      startup checkpoint line, the same shape a host logs

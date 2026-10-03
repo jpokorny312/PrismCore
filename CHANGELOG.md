@@ -18,6 +18,55 @@ source-compatible.)
   "English 2"). Hosts that label tracks from their own metadata are
   unaffected.
 
+## [3.2.6] — 2026-10-02
+
+Three landings: repair non-monotonic or missing DTS before writing fMP4
+(#113, `TimestampSanitizer` / `timestampRepairs`), report-only playback
+health events (#114, `playbackEvents()`), and a host subtitle delay API
+(#115, `setSubtitleDelaySeconds`). Shipped as a patch although it adds
+API, per the host pin discipline: a release a host takes is always a
+patch bump.
+
+### Added
+
+- `PrismCoreSession.setSubtitleDelaySeconds(_:)` / `subtitleDelaySeconds`
+  shift subtitle text against the picture (clamped to +/-10 s, non-finite
+  becomes 0), on top of the presentation origin. Host cues (`TimedTextCue`)
+  carry it at once; WebVTT renditions carry it in the `X-TIMESTAMP-MAP` of
+  segments written after the call, so the result is `.appliesToNewSegments`
+  mid-playback — AVPlayer does not re-load buffered subtitle segments. Covers
+  embedded text, captions, OCR'd bitmap tracks and `addExternalSubtitle`.
+  The software path gets `SoftwarePlaybackPipeline.setSubtitleDelaySeconds(_:)`,
+  in force on the next `activeSubtitleCues` read; a muxed fallback session
+  inherits the offset.
+- **`PrismCoreSession.playbackEvents()`**, a runtime counterpart to
+  `startupCheckpoints()`: `.slowServe`, `.serveTimedOut`, `.producerStalled`
+  (no packet read for 5 s while a request waits on the producer — never
+  while it is parked on purpose, so a pause is not a stall),
+  `.originThrottled` and `.originRecovered` (coordinated HTTP only; every
+  session on that origin sees them). Callable before or after `start()`,
+  finishes on `stop()`, keeps the newest 64. Report-only: nothing is
+  repaired automatically. `prismcore-cli serve` prints them.
+- **`PrismCoreSession.timestampRepairs`** (`TimestampRepairStats?`): how many
+  packets needed a DTS filled in, a DTS bumped past its predecessor, or a PTS
+  raised to its DTS before the muxer would take them. `nil` while nothing was
+  repaired; counts across re-anchors. `prismcore-cli segverify` prints the
+  same counts after a remux.
+
+### Fixed
+
+- **A source with broken decode timestamps no longer fails the remux.** Video
+  and stream-copied audio went from the demuxer to the mp4 muxer with only a
+  rescale, so one non-increasing DTS (a Matroska cut, a joined TS, packed
+  B-frames) or a PTS below its DTS made `av_interleaved_write_frame` return
+  `EINVAL` and the session stopped producing segments. Every packet now passes
+  a per-stream `TimestampSanitizer` first, with three local rules: a missing
+  DTS follows the previous one plus the packet's duration (or its PTS, only
+  where nothing reorders), a DTS that does not move forward is set one tick
+  past the previous, and a PTS below its DTS is raised to it. Nothing is
+  dropped and no GOP is rewritten. The sanitizer resets with each re-anchor's
+  fresh muxer. Per-packet cost is unmeasured.
+
 ## [3.2.5] — 2026-09-30
 
 Keeps host cue-tap subtitles on the plan's timeline origin after an early
@@ -2533,7 +2582,8 @@ HTTP server, with:
 - **Software path** — libavcodec into `AVSampleBufferDisplayLayer` for the video
   AVPlayer cannot decode at all.
 
-[Unreleased]: https://github.com/Wenzlik/PrismCore/compare/3.2.5...HEAD
+[Unreleased]: https://github.com/Wenzlik/PrismCore/compare/3.2.6...HEAD
+[3.2.6]: https://github.com/Wenzlik/PrismCore/compare/3.2.5...3.2.6
 [3.2.5]: https://github.com/Wenzlik/PrismCore/compare/3.2.4...3.2.5
 [3.2.4]: https://github.com/Wenzlik/PrismCore/compare/3.2.3...3.2.4
 [3.2.3]: https://github.com/Wenzlik/PrismCore/compare/3.2.2...3.2.3
