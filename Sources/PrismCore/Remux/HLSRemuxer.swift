@@ -802,10 +802,16 @@ final class HLSRemuxer: @unchecked Sendable {
         let isCopyable: (AVCodecID) -> Bool = { [forcedAudioBridgeCodecs] codecID in
             Self.copyableAudio.contains(codecID) && !forcedAudioBridgeCodecs.contains(codecID)
         }
+        // ...and the codec it named is bridged instead: `AudioBridge.canBridge` alone would refuse it (it knows the codecs that are never
+        // copied), the track would be left out and the session would serve silent video.
+        let canBridge: (AVCodecID) -> Bool = { [forcedAudioBridgeCodecs] codecID in
+            AudioBridge.canBridge(codecID: codecID, forced: forcedAudioBridgeCodecs)
+        }
         let routes = Self.routeAll(
             candidates: candidates,
             best: bestAudio >= 0 ? bestAudio : nil,
             preferredLanguage: preferredAudioLanguage,
+            canBridge: canBridge,
             isCopyable: isCopyable
         )
 
@@ -855,6 +861,7 @@ final class HLSRemuxer: @unchecked Sendable {
                 candidates: candidates,
                 best: bestAudio >= 0 ? bestAudio : nil,
                 preferredLanguage: preferredAudioLanguage,
+                canBridge: canBridge,
                 isCopyable: isCopyable
             ))
 

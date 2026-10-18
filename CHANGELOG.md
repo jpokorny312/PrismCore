@@ -10,6 +10,27 @@ source-compatible.)
 
 ### Fixed
 
+- **A codec the host forces through the audio bridge is bridged instead of
+  dropped.** `PrismCoreSession.Options.forcedAudioBridgeCodecs` takes a codec
+  the base set would stream-copy (AC-3, E-AC-3) out of the copyable set, but
+  the router then asked `AudioBridge.canBridge`, which only knows the codecs
+  that are never copied (`bridgeableAudio`: TrueHD, DTS, MP3, ...). A forced
+  AC-3 track was neither copyable nor bridgeable: it got no rendition and,
+  with no other audio track, the session served the muxed shape without any
+  audio - silent video, `audioDelivery == .unavailable`, a loopback URL
+  `index.m3u8` where a master was expected. On a host that forces AC-3 and
+  E-AC-3 (Ensō does by default, because a raw bitstream is noise where nothing
+  downstream decodes it) every HEVC file with such audio played without sound;
+  H.264 files were spared only because that host sends them to the server's
+  transcode. `AudioBridge.canBridge(codecID:forced:)` answers yes for a forced
+  codec wherever the build can decode it and has the encoder, and `HLSRemuxer`
+  asks it at both routing calls (the renditions and the muxed shape). New
+  tests (`RemuxIntegrationTests`) force AC-3 and E-AC-3 through a real session,
+  also beside a copyable track, and decode the served stream with libavformat
+  and the codec's decoder: the audio is there, re-encoded to what the build can
+  encode, as loud as the source, and `audioDelivery` is `.bridged` the moment
+  `start()` returns (a host decides on it then); the three fail on the
+  previous commit, and without the host's say-so AC-3 is still stream-copied.
 - **A seek no longer ends the remux a minute later on a file with reordered
   pictures.** After a demand-driven re-anchor libavformat's demuxer hands out
   the first `video_delay` packets of a B-frame stream (4 on a 1080p Blu-ray

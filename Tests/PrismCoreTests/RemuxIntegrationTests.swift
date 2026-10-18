@@ -1,6 +1,9 @@
 import Testing
 import Foundation
 import AVFoundation
+import Libavcodec
+import Libavformat
+import Libavutil
 @testable import PrismCore
 
 /// The session's readiness gate reads back what the remuxer wrote, so the
@@ -53,6 +56,71 @@ struct RemuxIntegrationTests {
     private func fetch(_ url: URL) async throws -> String {
         let (data, _) = try await URLSession.uncached.data(from: url)
         return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Decodes the audio of a served stream the way a player would read it (libavformat's hls demuxer, then the codec's decoder) and
+    /// returns how many sample frames came out and their RMS over all channels. `rms == 0` is silence: packets that decode to nothing.
+    private func decodedAudio(_ url: URL) throws -> (frames: Int, rms: Double) {
+        var opened: UnsafeMutablePointer<AVFormatContext>?
+        try #require(avformat_open_input(&opened, url.absoluteString, nil, nil) == 0, "the served stream does not open")
+        let input = try #require(opened)
+        defer { var closing: UnsafeMutablePointer<AVFormatContext>? = input; avformat_close_input(&closing) }
+        try #require(avformat_find_stream_info(input, nil) >= 0)
+        let index = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0)
+        try #require(index >= 0, "the served stream has no audio at all")
+        let stream = try #require(input.pointee.streams[Int(index)])
+        let parameters = try #require(stream.pointee.codecpar)
+        let codec = try #require(avcodec_find_decoder(parameters.pointee.codec_id))
+        var decoderStorage: UnsafeMutablePointer<AVCodecContext>? = avcodec_alloc_context3(codec)
+        defer { avcodec_free_context(&decoderStorage) }
+        let decoder = try #require(decoderStorage)
+        try #require(avcodec_parameters_to_context(decoder, parameters) >= 0)
+        try #require(avcodec_open2(decoder, codec, nil) >= 0)
+        var packetStorage: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+        defer { av_packet_free(&packetStorage) }
+        let packet = try #require(packetStorage)
+        var frameStorage: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        defer { av_frame_free(&frameStorage) }
+        let frame = try #require(frameStorage)
+
+        var frames = 0
+        var sumOfSquares = 0.0
+        var samples = 0
+        func drain() {
+            while avcodec_receive_frame(decoder, frame) == 0 {
+                let count = Int(frame.pointee.nb_samples)
+                let channels = Int(frame.pointee.ch_layout.nb_channels)
+                frames += count
+                let format = AVSampleFormat(rawValue: frame.pointee.format)
+                for channel in 0..<channels {
+                    for i in 0..<count {
+                        let value: Double
+                        switch format {
+                        case AV_SAMPLE_FMT_FLTP:
+                            value = Double(frame.pointee.extended_data[channel]!.withMemoryRebound(to: Float.self, capacity: count) { $0[i] })
+                        case AV_SAMPLE_FMT_FLT:
+                            value = Double(frame.pointee.extended_data[0]!.withMemoryRebound(to: Float.self, capacity: count * channels) { $0[i * channels + channel] })
+                        case AV_SAMPLE_FMT_S16P:
+                            value = Double(frame.pointee.extended_data[channel]!.withMemoryRebound(to: Int16.self, capacity: count) { $0[i] }) / 32768
+                        case AV_SAMPLE_FMT_S16:
+                            value = Double(frame.pointee.extended_data[0]!.withMemoryRebound(to: Int16.self, capacity: count * channels) { $0[i * channels + channel] }) / 32768
+                        default:
+                            value = 0
+                        }
+                        sumOfSquares += value * value
+                        samples += 1
+                    }
+                }
+            }
+        }
+        while av_read_frame(input, packet) >= 0 {
+            defer { av_packet_unref(packet) }
+            guard packet.pointee.stream_index == index else { continue }
+            if avcodec_send_packet(decoder, packet) >= 0 { drain() }
+        }
+        avcodec_send_packet(decoder, nil)
+        drain()
+        return (frames, samples > 0 ? (sumOfSquares / Double(samples)).squareRoot() : 0)
     }
 
     /// Poll a served MEDIA playlist until it carries `EXT-X-ENDLIST` (remux
@@ -190,6 +258,96 @@ struct RemuxIntegrationTests {
         if AudioBridge.isEncoderAvailable {
             #expect(audioCodecs == [AudioBridge.defaultTargetCodecName], "audio was \(audioCodecs)")
         }
+    }
+
+    /// The served stream has sound: about as many samples as the source's audio and a level in the range of the source's own - not the
+    /// silence a bridge makes of a track it never decoded. (The original is decoded through the same helper, from the file itself.)
+    private func expectAudible(_ served: URL, likeTheOriginal original: String) throws {
+        let source = try decodedAudio(try fixture(original))
+        let heard = try decodedAudio(served)
+        #expect(source.rms > 0.001, "the fixture itself is silent (\(source.rms))")
+        #expect(heard.frames >= source.frames * 9 / 10, "\(heard.frames) sample frames came out of \(source.frames)")
+        #expect(heard.rms > source.rms * 0.2 && heard.rms < source.rms * 5, "level \(heard.rms) against the source's \(source.rms)")
+    }
+
+    // `forcedAudioBridgeCodecs` (a host whose sink cannot take a raw AC-3/E-AC-3 bitstream - an Apple TV with no passthrough-capable
+    // receiver, a phone's own speaker): the track goes through the same bridge DTS/TrueHD use. It used to be DROPPED instead - the router
+    // asked `AudioBridge.canBridge`, which only knows the codecs that are never stream-copied, so a forced AC-3 track was neither
+    // copyable nor bridgeable, no rendition was made for it, and the session served a muxed playlist with no audio at all: silent video
+    // (the bedroom Apple TV, 2026-10-15: HEVC + AC-3 files without sound, loopback URL `index.m3u8` instead of `master.m3u8`).
+
+    @Test("AC-3 the host forces through the bridge is re-encoded, not dropped")
+    func forcedAC3IsBridged() async throws {
+        try #require(AudioBridge.isEncoderAvailable, "no encoder for the bridge in this build")
+        let session = try PrismCoreSession(url: try fixture("h264_ac3_51_20s.mkv"), forcedAudioBridgeCodecs: [AV_CODEC_ID_AC3])
+        let playlist = try await session.start()
+        defer { Task { await session.stop() } }
+
+        // A host decides on this the moment `start()` returns (a source whose audio nothing carried is silent video: it hands such a source
+        // to another path), so the answer has to be settled by then, not only when the remux is done.
+        #expect(session.audioDelivery == .bridged, "audio was \(session.audioDelivery) when start() returned: \(session.audioTrackDeliveries)")
+        #expect(session.audioTrackDeliveries.map(\.delivery) == [.bridged])
+
+        // A master with the track as a rendition - not the muxed, silent shape.
+        #expect(playlist.lastPathComponent == "master.m3u8", "served: \(playlist.lastPathComponent)")
+        let master = try await fetch(playlist)
+        #expect(audioMediaLines(master).count == 1, "master was:\n\(master)")
+
+        _ = try await waitForFinishedPlaylist(playlist)
+        let info = try SourceProbe.probe(url: playlist)
+        let audioCodecs = info.audioTracks.map(\.codecName)
+        #expect(!audioCodecs.contains("ac3"), "the raw bitstream must not reach the output: \(audioCodecs)")
+        #expect(audioCodecs == [AudioBridge.defaultTargetCodecName], "audio was \(audioCodecs)")
+        #expect(session.audioDelivery == .bridged)
+        try expectAudible(playlist, likeTheOriginal: "h264_ac3_51_20s.mkv")
+    }
+
+    @Test("E-AC-3 the host forces through the bridge is re-encoded, not dropped")
+    func forcedEAC3IsBridged() async throws {
+        try #require(AudioBridge.isEncoderAvailable, "no encoder for the bridge in this build")
+        let session = try PrismCoreSession(url: try fixture("hevc_eac3.mkv"), forcedAudioBridgeCodecs: [AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3])
+        let playlist = try await session.start()
+        defer { Task { await session.stop() } }
+
+        #expect(playlist.lastPathComponent == "master.m3u8", "served: \(playlist.lastPathComponent)")
+        _ = try await waitForFinishedPlaylist(playlist)
+        let info = try SourceProbe.probe(url: playlist)
+        let audioCodecs = info.audioTracks.map(\.codecName)
+        #expect(!audioCodecs.contains("eac3"), "the raw bitstream must not reach the output: \(audioCodecs)")
+        #expect(audioCodecs == [AudioBridge.defaultTargetCodecName], "audio was \(audioCodecs)")
+        #expect(session.audioDelivery == .bridged)
+        try expectAudible(playlist, likeTheOriginal: "hevc_eac3.mkv")
+    }
+
+    @Test("Forcing AC-3 through the bridge leaves the other tracks as they were")
+    func forcedAC3BesideACopyableTrack() async throws {
+        try #require(AudioBridge.isEncoderAvailable, "no encoder for the bridge in this build")
+        // AAC (English) + AC-3 5.1 (Czech): the AAC track is stream-copied, the AC-3 one is bridged.
+        let session = try PrismCoreSession(url: try fixture("h264_multi_audio.mkv"), forcedAudioBridgeCodecs: [AV_CODEC_ID_AC3])
+        let playlist = try await session.start()
+        defer { Task { await session.stop() } }
+
+        #expect(playlist.lastPathComponent == "master.m3u8")
+        let master = try await fetch(playlist)
+        #expect(audioMediaLines(master).count == 2, "master was:\n\(master)")
+        _ = try await waitForFinishedPlaylist(playlist)
+        let info = try SourceProbe.probe(url: playlist)
+        let audioCodecs = info.audioTracks.map(\.codecName)
+        #expect(!audioCodecs.contains("ac3"), "the raw bitstream must not reach the output: \(audioCodecs)")
+        #expect(audioCodecs.count == 2, "both tracks are in the output: \(audioCodecs)")
+        #expect(Set(info.audioTracks.compactMap(\.language)) == ["eng", "ces"])
+    }
+
+    @Test("Without the host's say-so AC-3 is still stream-copied")
+    func unforcedAC3IsCopied() async throws {
+        let session = try PrismCoreSession(url: try fixture("h264_ac3_51_20s.mkv"))
+        let playlist = try await session.start()
+        defer { Task { await session.stop() } }
+
+        _ = try await waitForFinishedPlaylist(playlist)
+        let info = try SourceProbe.probe(url: playlist)
+        #expect(info.audioTracks.map(\.codecName) == ["ac3"])
+        #expect(session.audioDelivery == .streamCopy)
     }
 
     @Test("Two audio tracks become two alternate renditions in the served master")

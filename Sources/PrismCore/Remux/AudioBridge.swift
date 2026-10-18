@@ -163,6 +163,21 @@ final class AudioBridge {
             && isEncoderAvailable
     }
 
+    /// `canBridge` for a session whose host forced `forced` through the bridge
+    /// (`PrismCoreSession.Options.forcedAudioBridgeCodecs`).
+    ///
+    /// A forced codec is one the base set would stream-copy (AC-3, E-AC-3), and
+    /// `bridgeableAudio` lists only the codecs that are NEVER copied, so asking
+    /// plain `canBridge` about it answers no: the router then found the forced
+    /// track neither copyable (the host said so) nor bridgeable (this said so),
+    /// left it out of the renditions and, with no other track, served a muxed
+    /// playlist with no audio at all - silent video, for every AC-3/E-AC-3 file
+    /// on a host that forces them. Such a codec can be bridged wherever the
+    /// build can decode it and has the encoder, like any other.
+    static func canBridge(codecID: AVCodecID, forced: Set<AVCodecID>) -> Bool {
+        forced.contains(codecID) ? canDecodeForBoost(codecID: codecID) : canBridge(codecID: codecID)
+    }
+
     /// Can this build decode `codecID` and re-encode it — the dialogue-boost
     /// question, which deliberately ignores `bridgeableAudio`: a boost
     /// rendition is derived from tracks that normally *stream-copy* (EAC3,
