@@ -316,8 +316,9 @@ public actor PrismCoreSession {
     private let landed = ProductionSignal()
     /// Behind `playbackEvents()`. Built before the server and provider so
     /// they can hold it from birth, which is what lets a host register at
-    /// any point in the session's life.
-    private let events = PlaybackEventSink()
+    /// any point in the session's life. Internal so that a test can put events
+    /// into the very stream the session hands out.
+    nonisolated let events = PlaybackEventSink()
     /// This session's share of the process-wide origin admission; released
     /// with the session.
     private let originObservation: HTTPOriginCoordinator.Observation?
@@ -664,6 +665,19 @@ public actor PrismCoreSession {
         provider.events = events
         provider.stallReport = { [remuxer] waitingSince, threshold in
             remuxer.stallReport(waitingSince: waitingSince, threshold: threshold)
+        }
+        // The producer's half of delivery: what the source gave it while it was
+        // asked. Installed here, before any thread exists (see
+        // `HLSRemuxer.onSourceThroughput`), and always: measuring costs the copy
+        // loop about 22 ns a packet whether or not a stream asked (CHANGELOG has
+        // the measurement), and a window nobody wants is dropped by the sink for
+        // a lock and a copy of the registration a second.
+        remuxer.onSourceThroughput = { [events] reading in
+            events.yield(.sourceThroughput(
+                bytesPerSecond: reading.bytesPerSecond,
+                bytes: reading.bytes,
+                readTime: .seconds(reading.seconds)
+            ))
         }
         self.server = LoopbackHTTPServer(provider: provider, reachability: reachability, events: events)
         // Keyed on the source URL's origin. A redirect to another origin is
@@ -1056,17 +1070,58 @@ public actor PrismCoreSession {
     /// Origin events require the coordinated reader (`coordinatedHTTP`); the
     /// built-in libavformat HTTP never reports a refusal back to the engine.
     ///
-    /// Calling this twice finishes the earlier stream and hands out a new one.
+    /// For the routine events as well — segments served, what the source
+    /// delivers — see `playbackEvents(delivery:)`; this form is the same stream
+    /// without them, which is exactly what it carried before they existed.
     public func playbackEvents() -> AsyncStream<PlaybackEvent> {
+        playbackEvents(delivery: false)
+    }
+
+    /// The same stream, optionally with the routine **delivery** events as well.
+    /// Everything said for `playbackEvents()` holds.
+    ///
+    /// ## Delivery events
+    ///
+    /// `delivery: true` adds what the session does when nothing is wrong:
+    /// `.segmentServed` for every segment handed to the player and
+    /// `.sourceThroughput` for what the source delivers to the producer (about one
+    /// per second of reading). Those are the numbers an AVPlayer access log cannot
+    /// give — the player reads the loopback, so its log describes the loopback,
+    /// never the link to the origin.
+    ///
+    /// They are opt-in because they are routine, not trouble: one with every segment
+    /// served and one for every second of reading, and a host that treats every
+    /// event as a problem to explain to the viewer would explain a healthy session
+    /// all film long. Left at the default, the stream carries exactly what it did
+    /// before they existed. They also share the newest-64 buffer, which at the
+    /// busiest (a producer that reads all the time) is about fifty seconds of history,
+    /// not the whole trouble history of a long film: a host that asks for them is
+    /// expected to drain the stream as it goes.
+    ///
+    /// ## Registration
+    ///
+    /// Last wins, and per session: calling this again finishes the earlier stream
+    /// and hands out a new one, and a successor session (`makeSession`, the
+    /// master-rejection fallbacks) starts with none — register on it too.
+    ///
+    /// `PlaybackEvent` grows; switch over it with a `default`.
+    public func playbackEvents(delivery: Bool) -> AsyncStream<PlaybackEvent> {
         let (stream, continuation) = AsyncStream<PlaybackEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(64)
         )
         if stopped {
             continuation.finish()
         } else {
-            events.replace(with: continuation)
+            events.replace(with: continuation, delivery: delivery)
         }
         return stream
+    }
+
+    /// Reading time that closes one `.sourceThroughput` window — a knob for tests
+    /// (`HLSRemuxer.sourceReadWindow`), whose fixtures are read in milliseconds.
+    /// Before `start()`: the producer reads it once.
+    func setSourceReadWindow(_ seconds: Double) {
+        remuxer.sourceReadWindow = seconds
     }
 
     /// The registered stream's continuation, `nil` when nobody asked — which

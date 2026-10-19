@@ -109,10 +109,14 @@ enum ProbeCommand {
 enum ServeCommand {
     static func run(_ arguments: [String]) async throws -> ExitCode {
         var duration: Duration?
+        var delivery = false
         var reader = ArgumentReader(arguments)
         try reader.parse { flag, reader in
-            guard flag == "--for" else { return false }
-            duration = .seconds(try reader.number(for: flag))
+            switch flag {
+            case "--for": duration = .seconds(try reader.number(for: flag))
+            case "--delivery": delivery = true
+            default: return false
+            }
             return true
         }
         // Armed before the probe: a Ctrl-C during a slow open should still
@@ -123,7 +127,7 @@ enum ServeCommand {
         return try await withServedSession(reader.options, stop: stop, beforeStart: { session in
             // Registered before `start()` so a throttle during the opening
             // reads is printed too; the stream ends with the session.
-            let events = await session.playbackEvents()
+            let events = await session.playbackEvents(delivery: delivery)
             Task { for await event in events { print("event: \(describe(event))") } }
         }) { playlist in
             print("serving: \(playlist.absoluteString)")
@@ -148,6 +152,17 @@ enum ServeCommand {
         case .originThrottled(let retryAfter):
             return "origin throttled" + (retryAfter.map { ", retry after \(seconds($0))" } ?? "")
         case .originRecovered: return "origin recovered"
+        case .segmentServed(let path, let index, let bytes, let waited, let transferred):
+            return String(
+                format: "served %@ (#%d, %.2f MB), waited %.3fs, transferred in %.3fs",
+                path, index, Double(bytes) / 1_000_000, waited / .seconds(1), transferred / .seconds(1)
+            )
+        case .sourceThroughput(let bytesPerSecond, let bytes, let readTime):
+            return String(
+                format: "source delivers %.2f MB/s (%.2f Mbit/s): %.2f MB in %.2fs of reading",
+                bytesPerSecond / 1_000_000, bytesPerSecond * 8 / 1_000_000,
+                Double(bytes) / 1_000_000, readTime / .seconds(1)
+            )
         }
     }
 }

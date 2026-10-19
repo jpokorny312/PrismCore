@@ -157,6 +157,85 @@ measure. Stages with timestamps are things that happened.
 path a source would take — and unit-test its own routing — without standing up
 either engine.
 
+### Watching playback
+
+`playbackEvents()` is the runtime counterpart of the startup checkpoints: an
+`AsyncStream<PlaybackEvent>` you may open before or after `start()`, that ends on
+`stop()` and only reports — nothing in it repairs anything.
+
+```swift
+let events = await session.playbackEvents()
+Task { for await event in events { log("\(event)") } }
+```
+
+By default it carries **trouble**: a serve that was slow (`.slowServe`) or never
+landed (`.serveTimedOut`), a producer that stopped reading while a request waited
+on it (`.producerStalled`), and an origin that throttled its readers
+(`.originThrottled`, `.originRecovered`; coordinated HTTP only).
+
+Ask for `delivery: true` and it also carries what the session does **when nothing
+is wrong**:
+
+```swift
+let events = await session.playbackEvents(delivery: true)
+Task {
+    for await event in events {
+        switch event {
+        case .segmentServed(let path, let index, let bytes, let waited, _):
+            // A segment went to the loopback connection: which one, how big, and how
+            // long the request waited for it to exist (the producer's time).
+            log("served \(path) #\(index) \(bytes) B after \(waited)")
+        case .sourceThroughput(let bytesPerSecond, _, _):
+            // What the SOURCE delivered to the producer while it was being asked.
+            log("source: \(Int(bytesPerSecond * 8 / 1_000)) kbit/s")
+        default:
+            break  // trouble, as above — and any case added later
+        }
+    }
+}
+```
+
+`PlaybackEvent` grows, so switch over it with a `default`. Registration is last
+wins and per session: a second call finishes the first stream, and a session built
+to replace this one (`makeSession`, the master-rejection fallbacks) starts with
+none.
+
+`.segmentServed` means the **connection accepted the segment**, not that the player
+read it: a segment within the socket buffers (about a megabyte on loopback) is
+accepted at once, whether or not the player ever reads it. A slow serve is reported
+by both `.slowServe` and `.segmentServed`, and the empty WebVTT that answers a
+subtitle segment that did not land is a served segment too (8 bytes, after
+`.serveTimedOut` and `.slowServe`).
+
+`.sourceThroughput` is the number an AVPlayer access log does not give. The player
+reads the loopback, so its log describes that read: `observedBitrate` strays from
+the source, and bytes over summed transfer time follow it only up to a factor that
+belongs to the player (the CHANGELOG has the numbers). The link to the origin is
+the producer's side. It is bytes per second **of the time the producer spent
+inside reads**, not of the wall clock — a producer that is parked, muxing or
+writing is not a slow link — measured at the I/O layer, so by the same call for
+libavformat's HTTP, the coordinated reader and a host's `PrismCoreInput`. One
+event per second of reading, each carrying its own bytes and seconds: average
+several by weighting with those, not by counting events.
+
+Know what it measures. Where the producer reads continuously and the reader waits
+for the link as it reads (FFmpeg's own HTTP; a host input that returns what has
+arrived) it tracks the link. Whatever fills while the producer is not reading is
+credited at no cost when it reads again: a reader that fetches ahead and keeps what
+it fetched (the coordinated reader's 1 MiB blocks; a host input with a cache) does
+it by design, and the socket buffers under FFmpeg's HTTP do it after a park. So a
+short session over-reads, one window can swing either way, and after a park the
+number says "the link is no slower than this" rather than what it can carry. A
+source that never makes the producer wait reports rarely or never; a source that
+has stopped delivering reports nothing while it is silent (`.producerStalled` says
+so, but only while a request is waiting on the producer).
+
+Delivery events are opt-in because they are routine — one with every segment
+served and one for every second of reading — and a host that explains every
+event to the viewer would take them for trouble. Without `delivery: true` the
+stream carries exactly what it did before they existed. Both share the newest-64
+buffer, so a host that asks for them should drain the stream as it goes.
+
 ### Preferred audio and subtitle language
 
 A host that knows which language the viewer wants says so when it builds the
@@ -626,7 +705,7 @@ link) that runs the engine on one source from the command line:
 
 ```
 swift run prismcore-cli probe     <url-or-path>   # SourceInfo, structure, routing verdict + reason
-swift run prismcore-cli serve     <url-or-path>   # loopback playlist URL for Safari / QuickTime
+swift run prismcore-cli serve     <url-or-path>   # loopback playlist URL for Safari / QuickTime (--delivery: and each segment served, and what the source delivers)
 swift run prismcore-cli bench     <url-or-path>   # the startup checkpoint line a host logs
 swift run prismcore-cli segverify <url-or-path>   # decode every served segment on its own
 swift run prismcore-cli validate  <url-or-path>   # Apple's mediastreamvalidator, if installed

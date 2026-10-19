@@ -533,14 +533,24 @@ public actor LoopbackHTTPServer {
             return .completed
         }
 
+        // Read before the provider is asked, and only when a stream wants
+        // delivery events: the clock is touched for nobody else, and a segment
+        // that waited on the producer is measured from the request, not from
+        // when the wait was handed over.
+        let requested: ContinuousClock.Instant? = events?.isObservingDelivery == true ? .now : nil
+
         switch await provider.data(forPath: path) {
         case .notFound:
             _ = await send(Self.errorResponse(status: "404 Not Found", keepAlive: keepAlive), on: connection)
             return .completed
         case .data(let body, let contentType):
-            _ = await sendResponse(
+            let ready = requested == nil ? nil : ContinuousClock.now
+            let sent = await sendResponse(
                 body: body, contentType: contentType, keepAlive: keepAlive, headOnly: headOnly, on: connection
             )
+            if sent, !headOnly {
+                reportDelivered(path: path, bytes: body.count, requested: requested, ready: ready)
+            }
             return .completed
         case .pending(let pending):
             return await respondToPending(
@@ -548,9 +558,33 @@ public actor LoopbackHTTPServer {
                 path: path,
                 on: connection,
                 keepAlive: keepAlive,
-                headOnly: headOnly
+                headOnly: headOnly,
+                requested: requested
             )
         }
+    }
+
+    /// The index in a segment's file name — `seg00012.m4s` under the variant or an
+    /// `audioN/` rendition, `seg00012.vtt` under a `subsN/` one — or `nil` for a
+    /// playlist, an init segment or anything else, none of which is a segment.
+    static func segmentIndex(inPath path: String) -> Int? {
+        PlanSegmentProvider.segmentIndex(inPath: path) ?? PlanSegmentProvider.vttSegmentIndex(inPath: path)
+    }
+
+    /// `.segmentServed` for a payload the connection has taken in full. `requested`
+    /// and `ready` are `nil` when nobody asked for delivery events, which is also
+    /// the answer for a path that is not a segment.
+    private func reportDelivered(
+        path: String, bytes: Int, requested: ContinuousClock.Instant?, ready: ContinuousClock.Instant?
+    ) {
+        guard let requested, let ready, let index = Self.segmentIndex(inPath: path) else { return }
+        events?.yield(.segmentServed(
+            path: path,
+            index: index,
+            bytes: bytes,
+            waited: ready - requested,
+            transferred: ContinuousClock.now - ready
+        ))
     }
 
     private func respondToPending(
@@ -558,7 +592,8 @@ public actor LoopbackHTTPServer {
         path: String,
         on connection: NWConnection,
         keepAlive: Bool,
-        headOnly: Bool
+        headOnly: Bool,
+        requested: ContinuousClock.Instant?
     ) async -> Outcome {
         // The resolution runs in its own task so the slow-serve race can give
         // up on *waiting* without giving up on the *work* — the payload is
@@ -580,9 +615,13 @@ public actor LoopbackHTTPServer {
         if let quick {
             switch quick {
             case .data(let body, let contentType):
-                _ = await sendResponse(
+                let ready = requested == nil ? nil : ContinuousClock.now
+                let sent = await sendResponse(
                     body: body, contentType: contentType, keepAlive: keepAlive, headOnly: headOnly, on: connection
                 )
+                if sent, !headOnly {
+                    reportDelivered(path: path, bytes: body.count, requested: requested, ready: ready)
+                }
             default:
                 _ = await send(Self.errorResponse(status: "404 Not Found", keepAlive: keepAlive), on: connection)
             }
@@ -616,7 +655,8 @@ public actor LoopbackHTTPServer {
             resolution.cancel()
         }
         guard !Task.isCancelled else { return .aborted }
-        let waited = ContinuousClock.now - began
+        let ready = ContinuousClock.now
+        let waited = ready - began
 
         switch landed {
         case .data(let body, _):
@@ -627,6 +667,7 @@ public actor LoopbackHTTPServer {
             // then is `waited` the whole wait. A serve that missed is the
             // provider's `.serveTimedOut` instead.
             events?.yield(.slowServe(path: path, waited: waited))
+            reportDelivered(path: path, bytes: body.count, requested: requested, ready: requested == nil ? nil : ready)
             return .completed
         default:
             // Committed to a 200 and then missed. Abort the transfer instead of

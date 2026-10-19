@@ -8,6 +8,127 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **`playbackEvents(delivery: true)`: which segments were served, and what the
+  source delivers.** Two new `PlaybackEvent` cases for a host that wants to see
+  a healthy session and not only a sick one — where AVPlayer's access log
+  describes the player's own reads of the loopback and only those:
+  - `.segmentServed(path:index:bytes:waited:transferred:)`: a segment (media or
+    subtitle, any rendition) was handed to the loopback connection in full.
+    `waited` is how long the request waited for the segment to exist — nothing
+    for a file on disk, the producer's time for one still being cut, which
+    makes it the part of a late segment that belongs to the source.
+    `transferred` is the time the connection took to accept the payload. **That
+    is acceptance, not reading:** a payload that fits the socket buffers (about
+    a megabyte on loopback) is accepted at once, so it is reported even if the
+    player drops the connection without reading it — a client that sends its
+    request and never reads got the event for 100 KB and 1 MB and none for
+    1.5 MB and up (`reportedOnAcceptanceNotOnReading` pins the small case) — and
+    only a larger payload makes `transferred` follow the player's pace. Not sent
+    for a playlist, an init segment, a `HEAD`, a miss, or a connection that
+    failed before it had taken the payload. A fetch that is also trouble is
+    reported as both: `.slowServe` and then this, and, for a subtitle segment
+    that did not land, `.serveTimedOut`, `.slowServe` (it waited past the
+    threshold) and then this for the 8-byte empty WebVTT that answers it
+    (`subtitleTimeoutIsReportedThreeWays`).
+  - `.sourceThroughput(bytesPerSecond:bytes:readTime:)`: what the source
+    delivered to the producer while it was being asked. Bytes the I/O layer
+    pulled (`AVIOContext.bytes_read`, so the same call for libavformat's HTTP,
+    the coordinated reader and a host's `PrismCoreInput`) over the time the copy
+    loop spent **inside `av_read_frame`** — not over the wall clock: a producer
+    that is parked, muxing or writing is not a slow link, and a meter over wall
+    time would read every full buffer as a dying one. One event per second of
+    reading, carrying its window's own bytes and seconds so that a host averages
+    by weight (Σbytes / Σseconds) rather than by counting events. A window closes
+    at the end of the read that fills it, so after a park it can be older than it
+    arrives. Not the startup probe's reads; nothing from a producer that never
+    waits long enough to fill a window, and nothing while a read has not
+    returned — `.producerStalled` says so, but only while a request is waiting on
+    the producer.
+
+  The two are **opt-in**: `playbackEvents()` is unchanged and
+  `playbackEvents(delivery: true)` adds them. They are routine, not trouble — a
+  host that explains every event to the viewer would explain a healthy film all
+  the way through — and they share the newest-64 buffer, where they would
+  otherwise push the rarer trouble events out for a host that reads late (the
+  test `deliveryEvictsTroubleFromAnUndrainedStream` pins that trade-off). A host
+  that never reads still holds at most 64 events however many arrive (10 000
+  yielded through the session's own stream in the test, 64 kept). Registration is
+  last-wins and per session, as before. `prismcore-cli serve --delivery` prints
+  them. **API note:** `PlaybackEvent` gains two cases, so a host that switches
+  over it exhaustively without a `default` needs one (the only such switch in
+  this repository, the CLI's, is updated); `playbackEvents()` keeps its
+  zero-argument form for the same reason.
+
+  *What was measured* (2026-10-19, macOS 27, Apple Silicon; costs from a release
+  build on a machine whose load average was 15 to 17 from other work, so read
+  them as upper bounds):
+  - Handing one event to the stream costs 45 ns with nobody registered, 163 ns
+    registered for trouble only (the event is filtered), 424 ns to a delivery
+    stream nobody reads, 2.0 µs to one a task is draining. A 1 MB segment
+    through the loopback server takes about 0.54 ms with or without the events:
+    the four configurations' medians (532 to 543 µs) lie inside the spread
+    between rounds (507 to 669 µs), so one event per segment is not measurable
+    against the request it describes. In the copy loop the meter adds 22 ns per
+    packet (one clock read, two loads of the byte counter, a branch and the
+    window's sum; 21 ns of the loop's own clock read to 43 ns), which is 7 µs
+    per second of media at 300 packets a second. While a producer reads all
+    the time the stream carries about 1.3 events a second (a reading a second,
+    plus two segment fetches per segment of six seconds); startup, seeks and
+    further renditions add to that, and the newest 64 are then about fifty
+    seconds for a host that drains late and everything for one that drains as it
+    goes.
+  - Against an origin throttled to a known rate (`RangeFixtureServer`: one
+    bandwidth schedule for every connection, over HTTP), libavformat's HTTP as
+    the reader, and a real `AVPlayer` started on the session's playlist and
+    playing the 30 s fixture for 12 s (startup took 48 s, 5 s and 1 s at the
+    three rates), two runs per rate with the engine's default one-second
+    windows: the source throughput came to 29.4 / 29.4 KB/s at an origin of 30,
+    118.9 / 118.8 at 120 and 606 / 604 at 600 KB/s, with a scatter between
+    windows of 7 % of the rate at 30 KB/s and 4 % at 120. With 0.25 s windows and
+    a fourth rate: 29.4 / 29.4, 118.8 / 119.0, 609 / 603 and 3211 / 3111 at
+    3000 KB/s (the last from one window — the file is read in 0.4 s — and 4 to
+    7 % over the ceiling, which a window that short can be; socket buffering is
+    the likely reason, not isolated). The access log of the same playbacks
+    (largest event, KB/s): `observedBitrate` 244 / 262, 124 / 329 and 751 / 772
+    against those ceilings — 8.1 and 8.7 times the ceiling at 30 KB/s, 1.03 and
+    2.74 at 120, 1.25 and 1.29 at 600 — and the bytes over the summed
+    `transferDuration` 16.4 / 16.3, 65.4 / 65.5 and 329 / 330, a steady 0.54 to
+    0.55 of the ceiling at all three rates (at 3000, in the 0.25 s runs:
+    `observedBitrate` 3394 / 2445, the quotient 1955 / 1724, which is 0.65 and
+    0.57). So that quotient does follow the source's rate here, scaled by a factor
+    that belongs to the player:
+    its transfers overlap — the summed transfer time at 30 KB/s, 78 s, is longer
+    than the whole run, 60 s — and how much they overlap is not in the log. Like
+    `observedBitrate` it is an average over the item and cannot be windowed. The
+    stream reports the rate itself, per second of reading, without the factor.
+  - End to end with the CLI (a manual run, not a test): `prismcore-cli serve
+    <url> --delivery` against `CHUNK_BYTES=262144 RATE_BPS=300000
+    Scripts/proxy-model-server.py` printed two readings of 0.31 MB/s (0.56 MB in
+    1.80 s and 0.52 MB in 1.68 s of reading) and, once a client fetched them, one
+    `served` line for each of the twelve segments. (That script writes in 256 KB
+    pieces, so a smaller `CHUNK_BYTES` does not pace it as set.)
+  - The same on a host input that delivers at a fixed rate (`PacedInput`): with
+    150 ms of non-reading work after every segment the rate stays at what the
+    input delivered per second inside its reads (0.98 to 1.0 over 20 runs in an
+    independent review, ten of them with twelve busy threads), while the same bytes over the wall clock come
+    to under 60 % of it. The test fails when the meter's denominator is the wall
+    clock (shown by making it so).
+
+  *What is not shown.* The **coordinated reader** over-reads on a short source:
+  it fetches 1 MiB blocks and keeps them, the probe has already fetched the
+  head, so the producer's reads of it cost nothing and only the last 0.23 MB of
+  the fixture is ever waited for (4 to 5 times the origin's rate: 3.8 to 4.9
+  over the runs of two people; pinned by `aReaderThatFetchedAheadOverReadsAtFirst`). Whether the
+  pooled rate over a whole film, where blocks are fetched inside the loop, is the
+  link's is argued from the block cycle and not measured — the fixtures are too
+  short for it. The same holds for any host input with a cache of its own, and,
+  on a smaller scale, for libavformat's HTTP after a park: whatever the socket
+  buffers took while the producer was not reading is credited when it reads
+  again. Nothing here ran on a device, over a real network or against a source
+  that reorders, and no `AVPlayer` ran against a throttled origin on iOS or tvOS.
+
 ### Fixed
 
 - **A codec the host forces through the audio bridge is bridged instead of

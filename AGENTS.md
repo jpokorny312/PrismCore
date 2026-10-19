@@ -303,6 +303,12 @@ runs shorter. It does not replace them.
   - `PRISMCORE_HDR10PLUS_MEDIA` — the HDR10+ scout on a real encode (the
     fixtures' SEI is script-injected; see `generate_hdr10plus.sh`)
   - `PRISMCORE_BENCH` — startup cost
+  - `PRISMCORE_EVENTS_BENCH` — what the delivery events cost, and how the source
+    throughput they report relates to a real `AVPlayer`'s access log against an
+    origin throttled to a known rate (`DeliveryEventsBenchmark`; knobs
+    `PRISMCORE_EVENTS_BENCH_RATES`, `_WINDOW`, `_REPEAT`, `_SECONDS`,
+    `_COORDINATED`). Timings are only worth reading from a release build:
+    `swift test -c release -Xswiftc -enable-testing`
 - Fixtures are synthetic (`testsrc2` + `sine`), generated with system `ffmpeg`
   and committed under `Tests/PrismCoreTests/Fixtures/`. They prove the
   pipeline, never the premium claims — Atmos and Dolby Vision need real media
