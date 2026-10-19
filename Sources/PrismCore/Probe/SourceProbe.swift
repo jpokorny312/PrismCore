@@ -495,9 +495,13 @@ public struct SubtitleTrackInfo: Sendable, Equatable {
         /// Text codec (SubRip / ASS / SSA / WebVTT / mov_text): carried as a
         /// WebVTT `SUBTITLES` rendition, so it survives PiP and AirPlay.
         case textRendition
-        /// Bitmap codec (PGS / DVB / DVD / XSUB) or teletext: **not** carried.
-        /// Reported so the host can render it in its own overlay — a rendition
-        /// would need OCR, which phase 6 doesn't ship.
+        /// Bitmap codec (PGS / DVB / DVD / XSUB) or teletext: **not** a text
+        /// rendition. Reported so the host can draw it in its own overlay:
+        /// PGS, DVB and DVD streams arrive as pictures through
+        /// `PrismCoreSession.setBitmapCueHandler` (`BitmapCue`); XSUB and
+        /// teletext do not. Where the platform has Vision and the source has no
+        /// text track, PGS / DVB / DVD also become OCR renditions — text, an
+        /// approximation, but the form that survives PiP and AirPlay.
         case bitmapHostOnly
         /// Something we neither convert nor recognize as bitmap.
         case unsupported
@@ -601,7 +605,9 @@ public struct SourceInfo: Sendable, Equatable {
         subtitleTracks.filter { $0.kind == .textRendition }
     }
 
-    /// Bitmap subtitle tracks the host has to render itself.
+    /// Bitmap subtitle tracks the host has to render itself — for PGS, DVB and
+    /// DVD, as pictures: choose their `streamIndex` with
+    /// `PrismCoreSession.setBitmapCueStreams(_:replayingFrom:)`.
     public var bitmapSubtitleTracks: [SubtitleTrackInfo] {
         subtitleTracks.filter { $0.kind == .bitmapHostOnly }
     }

@@ -8,8 +8,107 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **Bitmap subtitles (PGS, DVB, DVD) reach the host as pictures, without text
+  recognition.** `PrismCoreSession.setBitmapCueHandler(_:)` and
+  `setBitmapCueStreams(_:replayingFrom:)` deliver the streams the viewer chose
+  as `BitmapCue`s: the disc's own picture (premultiplied BGRA in sRGB,
+  transparent wherever the disc is), where it goes (`frame`) inside the frame
+  it was authored for (`referenceSize`), whether the disc marked it forced,
+  and `start`/`end` on the player's clock - the same clock and the same
+  subtitle delay `TimedTextCue` has. Until now a bitmap track reached a host
+  only through the OCR rendition, which keeps the words and loses the
+  typeface, the colour, the place on the picture and the forced flag, and
+  which recognition sometimes reads wrongly. The OCR rendition is unchanged
+  and stays the fallback for what a host cannot draw: an external display,
+  Picture in Picture, AirPlay.
+
+  The shape of it, and why:
+
+  - **One cue per rectangle, not per composition.** A composition can hold
+    several rectangles, and PGS flags forced per composition object. Merged
+    into one picture in their common bounding box - which is what the
+    recognizer's picture does, and it is still built that way - a sign at the
+    top and dialogue at the bottom become one canvas almost as tall as the
+    frame and nearly all air, and a forced rectangle can no longer be told
+    from the ordinary one beside it. The rectangles of one composition share
+    `start` and `end`; the host draws every cue active at the player's time.
+  - **A cue is handed over when its end is known**, so the host never holds a
+    picture open waiting to be told to take it down: PGS's clear, the next
+    composition, a DVD sub-picture's stop time (believed - it is exact), or,
+    for a composition nothing ended, the latest it can stand once the demux has
+    read past it (the video segment cuts say how far it has read): the OCR
+    rendition's 10 s cap, or a DVB page's time-out where that is shorter. A
+    DVB time-out is a ceiling and not an end: the next page replaces the page,
+    and believed as an end two subtitles would be on screen at once. The
+    price is that a cue arrives up to its own length after it starts; the
+    producer runs up to 30 s ahead of what the player has fetched
+    (`DemandCoordinator.producerLeadSeconds`, read from the code, not
+    measured), which is what makes that early enough, and the first cue after
+    a start or a seek into uncached territory can be late by it. (The cap and
+    the DVB handling are chosen, not measured.)
+  - **The engine remembers nothing it delivered.** The text tap keeps every
+    cue, because a cue is a few dozen bytes; a bitmap cue is a picture, a
+    two-hour film has two thousand of them and a disc up to thirty tracks. A
+    handler registered late is not replayed what came before, a cue the
+    producer reads again is delivered again as a new image, and
+    `BitmapCue.id` is how a host tells it is the same cue.
+  - **Streams are chosen, and an unchosen one costs nothing**, decode
+    included, as with the lazy OCR arming. Choosing one after `start()` leaves
+    a gap - the demux has already passed the packets between the playhead and
+    where the producer is parked - and a jump back into segments the cache
+    still holds delivers no cues, because nothing is demuxed. `replayingFrom:`
+    closes both: the producer is asked to read the source again from that
+    position on the player's clock, from ten seconds before it so that a
+    picture that began earlier and still stands is produced too. It costs what
+    a seek into uncached territory costs, so it is only done when asked for,
+    and not at all on a source without a segment plan.
+  - **Streams without an OCR rendition work too**: a PGS track beside an SRT
+    (which gets none, by design) and every bitmap track on a platform without
+    Vision. Nothing is declared for them in the master.
+  - The frame comes from the stream: PGS states it in every composition, a
+    DVD stream in the `size:` line of its index, DVB as 720 x 576 or what its
+    display definition says. Only a codec that says nothing falls back to the
+    video's size.
+  - Cues arrive on the producer thread; the handler and the choice are carried
+    onto the session a master rejection replaces. Remux path only: the
+    software path delivers no bitmap subtitles, as before. XSUB and teletext
+    are not covered.
+
+  New tests (`BitmapCueTests`, 56): the decoding tests run the **real
+  libavcodec decoders** (PGS, DVD and DVB) on packets assembled by hand from
+  the formats' layouts, because this build - like any FFmpeg build - cannot
+  encode them; a session test plays a Matroska file written at test time from
+  a committed fixture and a hand-made PGS stream, through the probe, the
+  plan, the producer thread and the public API, including a replay. That
+  proves the path from packet to cue. It does **not** prove the decoder copes
+  with a real disc (cropped objects, objects split over packets, palette-only
+  updates, fades); that is what the opt-in `RealMediaPGSTests` is for, which
+  now also checks the pictures (it has been run against a synthetic file
+  only: no real PGS media was at hand). The code was broken on purpose 24 times,
+  one rule at a time - the seek, the origin, the alpha, the rounding, the forced
+  flag, the frame, the cap, the time-out, the choice, the routing of the
+  packets, the replay, the hand-over to a fallback session, the flush of a
+  stream chosen again - and every time at least one of these tests went red; three breakages were first missed or took the test
+  process down, and the tests were fixed until they did not.
+
 ### Fixed
 
+- **A seek left the PGS decoder in its old epoch.** `BitmapSubtitleDecoder.flush()`
+  called `avcodec_flush_buffers`, which only calls the codec's own flush hook,
+  and libavcodec 62's PGS decoder does not clear its objects and palettes on
+  it (observed, not traced into the decoder). A display set that re-shows an object defined before the seek
+  without defining it again - how a stream continues an epoch, in a fade or a
+  repeat - still came out of a flushed decoder, so a picture from before the
+  jump could appear after it, at the new time. The OCR rendition had the same
+  defect, whatever its comment said. A flush now opens a fresh decoder context
+  from the stream's parameters (2 to 6 microseconds per flush, measured in a
+  debug build); until the next epoch start the
+  decoder produces nothing, which is the honest outcome of joining mid-epoch.
+  New test `flushForgetsTheEpoch` fails on the previous code: a display set
+  that refers to an object of the epoch before the flush still yields its
+  rectangle.
 - **A codec the host forces through the audio bridge is bridged instead of
   dropped.** `PrismCoreSession.Options.forcedAudioBridgeCodecs` takes a codec
   the base set would stream-copy (AC-3, E-AC-3) out of the copyable set, but

@@ -67,7 +67,7 @@ Shipping something on PrismCore? Open an issue and it gets listed here.
 | Multi-audio | Every viable track becomes an HLS alternate rendition with its language, name and channel count, so AVPlayer gets a real `AVMediaSelectionGroup` to switch on. `preferredAudioLanguage:` decides which one is `DEFAULT`, so playback starts in the right language instead of switching visibly after it. The software path switches too: `SoftwarePlaybackPipeline.selectAudioTrack(streamIndex:)` swaps the decoder mid-playback without touching the clock or the picture |
 | Dialogue boost | Opt-in (`dialogueBoost:` on the session): extra "Dialogue Boost" renditions derived from the default track — which is the `preferredAudioLanguage:` track when one matched — decoded, centre channel favoured (bed −6 dB / −12 dB), re-encoded to EAC3 — marked `public.accessibility.enhances-speech-intelligibility` so hosts find them by characteristic. Engine-side because AVFoundation ignores `audioMix`/audio taps on HLS items. The base track stays bit-for-bit (Atmos included). Needs the `eac3` encoder and a centre-channel source; stereo would need `dialoguenhance`, which current builds don't ship |
 | Subtitles (text) | SubRip / ASS / SSA / WebVTT / mov_text converted during the remux read into segmented WebVTT renditions, cut on the video's own boundaries — so text survives PiP and AirPlay instead of living in a host overlay. ASS inline italics / bold / underline become WebVTT tags; `\an` / `\pos` placement and a WebVTT track's own cue settings ride the timing line, so a caption authored at the top of the frame stays there. External `.srt` / `.vtt` register as first-class renditions |
-| Subtitles (bitmap) | PGS / DVB / DVD read by on-device Vision OCR into the same rendition machinery. Lossy by design — typography dies, text survives — and the raw tracks stay surfaced for a host that wants to draw them pixel-accurately |
+| Subtitles (bitmap) | PGS / DVB / DVD read by on-device Vision OCR into the same rendition machinery. Lossy by design — typography dies, text survives. A host that draws its own overlay can have the pictures instead, with no recognition in between: `setBitmapCueHandler` / `setBitmapCueStreams` deliver each rectangle as a `BitmapCue` with its transparency, its place, the frame that place is measured in and the disc's forced flag (see *Bitmap subtitles as pictures*). The OCR rendition stays the fallback for what a host cannot draw — an external display, PiP, AirPlay |
 | Closed captions (CEA-608) | Captions embedded in the **video** — A/53 `cc_data` in H.264 / HEVC SEI, the form US broadcast recordings, MPEG-TS captures and many disc rips carry — decoded during the remux read into the same WebVTT rendition machinery, so CC1…CC4 appear as real `AVMediaSelectionOption`s and survive PiP, AirPlay and external display. Pop-on, roll-up and paint-on, the full basic / special / extended character sets, labelled by channel and by the video track's language where it declares one. Caption bytes are reordered from decode to presentation order before decoding, which is what keeps them from drifting on any source with B-frames. A bounded packet scan before the first segment decides whether a source has captions at all — one that does not pays nothing in the copy loop. Styling (colour, italics, underline) and cell-accurate positioning are dropped on purpose, so the system caption renderer applies the viewer's own accessibility style |
 | Closed captions (CEA-708) | **Not decoded.** DTVCC packets are recognised in `cc_data` and skipped. A 708 service decode means the window model — eight windows with their own anchors, sizes, pen states and row locks — and a partial one puts text on screen in the wrong place while presenting itself as a caption track. Because effectively every 708 encoder also emits the 608 compatibility bytes, this costs nothing on real content; a stream that carries *only* 708 gets no caption rendition rather than a broken one |
 | Seek & cache | Keyframe-aligned segment plan published upfront, demand-driven production with re-anchoring, absolute-`tfdt` continuity across restarts, byte-budgeted retention (1 GiB default; an evicted segment is reproduced on demand, so the budget bounds disk, not seekability) |
@@ -252,6 +252,47 @@ missing until the next cue. Bitmap/OCR and external subtitle selection remain
 outside this software surface. ASS colours, fonts, karaoke and drawing overrides
 are not preserved by the text converter — only the inline styles and placement
 WebVTT has words for.
+
+### Bitmap subtitles as pictures
+
+PGS, DVB and DVD subtitles are pictures. The OCR rendition turns them into text
+so they survive Picture in Picture and AirPlay, and in doing so loses the
+typeface, the colour, the place on the picture and the forced flag. A host that
+draws its own overlay can have the pictures themselves:
+
+```swift
+let track = info.bitmapSubtitleTracks[0]               // from the probe
+await session.setBitmapCueHandler { cue in             // producer thread: hop off it
+    overlayQueue.async { overlay.insert(cue) }
+}
+await session.setBitmapCueStreams([track.streamIndex]) // before start(): from the first packet
+```
+
+Each `BitmapCue` is one rectangle of the disc's composition: `image` (premultiplied
+BGRA, transparent where the disc is — draw it as it is), `frame` inside
+`referenceSize` (the frame the stream was authored for, origin top left), `isForced`,
+and `start`/`end` on the player's clock, so `AVPlayer.currentTime()` picks the cues to
+show. The mapping onto the video is two scale factors, `video.width / referenceSize.width`
+and `video.height / referenceSize.height`; a DVD frame is 720 wide whatever the
+picture's aspect, and the video is stretched to its display aspect by the same two.
+
+What to know before relying on it:
+
+- **A cue arrives once its end is known**, up to its own length after it starts, and
+  never as a picture the host has to take down. The producer runs ahead of the
+  player, which is what makes that early enough.
+- **Nothing is remembered.** A handler registered late sees only what is produced
+  from then on, and a cue the producer reads again arrives again as a new image
+  (`BitmapCue.id` says it is the same one). Keep what you need near the playhead.
+- **Choose streams before `start()`, or ask for the cues you missed.** A stream chosen
+  mid-film has not seen what the demux already passed, and a jump back into
+  segments the cache still holds produces no cues. `setBitmapCueStreams(_:replayingFrom:)`
+  with the player's current time has the producer read the source again from there.
+  It costs what a seek into uncached territory costs, so it is not done unless asked.
+- **The OCR rendition is unchanged**: selecting it in AVPlayer still arms the
+  recognizer, and AVKit draws what it recognizes — so do not show the rendition and the
+  pictures of one stream at once. Switch to the rendition when the host cannot draw.
+- The remux path only; the software path delivers no bitmap subtitles.
 
 ### Host setup on tvOS
 
@@ -561,7 +602,8 @@ Deliberate omissions, so you don't have to read the source to find them:
   and gets out of the way. Your `AVPlayer` remains the source of truth for time,
   rate and status.
 - **No subtitle rendering.** Text becomes WebVTT renditions AVPlayer selects
-  itself; bitmap tracks are surfaced for a host that wants to draw them.
+  itself; bitmap tracks are surfaced, and delivered as pictures (`BitmapCue`),
+  for a host that wants to draw them.
 - **No playlist or queue management.** Make a new session for the next title.
 - **No analytics.** Nothing leaves the device, and nothing phones anywhere.
 - **No re-encoding of video, ever.** If a frame would have to be touched, that

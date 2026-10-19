@@ -125,6 +125,40 @@ final class HLSRemuxer: @unchecked Sendable {
         return true
     }
 
+    /// Ask the producer to read the source again from the position `seconds`
+    /// on the played timeline, so the host's picture cues for that region are
+    /// produced (again). Returns whether there was a plan to re-anchor in; the
+    /// sequential shape has none and the request is refused rather than
+    /// dropped silently.
+    ///
+    /// The host asks for this when it chose a bitmap stream mid-film, or
+    /// jumped back into a region the segment cache still holds: the demux only
+    /// runs ahead of the player (never back into segments that are on disk),
+    /// so a stream chosen now has seen none of the packets between the
+    /// playhead and wherever the producer is parked. The segments this
+    /// rewrites are the same cuts of the same packets (the plan fixes the
+    /// boundaries) and land atomically, which is how the producer already
+    /// re-makes evicted segments on demand.
+    ///
+    /// The anchor reaches back by the longest a picture can stand, so a cue
+    /// that began before `seconds` and is still on screen at it is produced
+    /// too.
+    func requestSubtitleReplay(fromPlayedSeconds seconds: Double) -> Bool {
+        guard seconds.isFinite, let demand, let plan = demand.publishedPlan, let head = plan.entries.first,
+              plan.timeBaseNum > 0, plan.timeBaseDen > 0 else { return false }
+        let tick = Double(plan.timeBaseNum) / Double(plan.timeBaseDen)
+        // The played timeline counts from the plan's head entry, the same
+        // origin the cue taps rebase against.
+        let sourceSeconds = Double(head.startPTS) * tick + max(0, seconds - BitmapCueTap.maximumCueSeconds)
+        let anchor = min(max(0, plan.segmentIndex(containing: Int64((sourceSeconds / tick).rounded()))),
+                         plan.entries.count - 1)
+        // Forced, as `requestAudioDelay` forces: an unforced request for the
+        // segment the producer is on (or just ahead of) is taken for work it
+        // is about to do anyway and dropped, and here the point is the read.
+        demand.requestProduction(of: anchor, force: true)
+        return true
+    }
+
     /// The producer's side of the handshake, called only at a re-anchor:
     /// takes the outstanding request, if any, and makes it the one in force.
     ///

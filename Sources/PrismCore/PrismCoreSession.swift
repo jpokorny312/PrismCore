@@ -305,6 +305,11 @@ public actor PrismCoreSession {
     /// The host's cue sink, replayed onto a fallback session the same way —
     /// a master rejection must not silently cost the host its captions.
     private var timedTextCueHandler: (@Sendable (TimedTextCue) -> Void)?
+    /// The host's picture sink and the streams it chose, replayed onto a
+    /// fallback session for the same reason — and because a clone starts from
+    /// the first packet, nothing has to be asked to be read again there.
+    private var bitmapCueHandler: (@Sendable (BitmapCue) -> Void)?
+    private var bitmapCueStreams: Set<Int> = []
     /// Where this session's playlists and segments live. Internal so the
     /// startup-cost benchmark can watch artifacts appear as they land.
     let workDirectory: URL
@@ -925,6 +930,16 @@ public actor PrismCoreSession {
         if let handler = timedTextCueHandler {
             await fallback.setTimedTextCueHandler(handler)
         }
+        // The pictures too: a viewer who chose a PGS track must not lose it to
+        // a master rejection any more than the text tap's host loses its
+        // captions. The choice goes after the sink; the clone has not started,
+        // so no replay is needed.
+        if let handler = bitmapCueHandler {
+            await fallback.setBitmapCueHandler(handler)
+        }
+        if !bitmapCueStreams.isEmpty {
+            await fallback.setBitmapCueStreams(bitmapCueStreams)
+        }
     }
 
     // MARK: - Subtitles (phase 6)
@@ -977,6 +992,115 @@ public actor PrismCoreSession {
     public func setTimedTextCueHandler(_ handler: (@Sendable (TimedTextCue) -> Void)?) {
         timedTextCueHandler = handler
         remuxer.subtitles.setCueHandler(handler)
+    }
+
+    /// Hand the host the **pictures** of the bitmap subtitle streams it chose —
+    /// PGS, DVB and DVD, as the disc authored them — with everything needed to
+    /// draw them: transparency, place, the frame that place is measured in, the
+    /// forced flag (`BitmapCue`). No text recognition is involved.
+    ///
+    /// This is half of the delivery: the sink. `setBitmapCueStreams(_:replayingFrom:)`
+    /// says which streams the viewer chose, because nothing is decoded for a
+    /// stream nobody chose — a disc can carry thirty of them, and a cue is a
+    /// picture, not a line of text. A handler with no stream chosen receives
+    /// nothing.
+    ///
+    /// ```swift
+    /// await session.setBitmapCueHandler { cue in overlay.insert(cue) }   // hop off the producer thread inside
+    /// await session.setBitmapCueStreams([track.streamIndex])             // before start(): from the first packet
+    /// ```
+    ///
+    /// **What the contract is**
+    /// - Cues arrive **on the producer thread**, in the order the demux
+    ///   produces them. The remux read waits for the handler to return, so
+    ///   hand the cue to the host's own queue and return.
+    /// - A cue is delivered once its **end is known**: the disc's clear, the
+    ///   next composition, or an explicit end (DVD's stop time). When nothing
+    ///   ends a composition, it ends at the latest it can stand, once the demux
+    ///   has read past that: 10 s (the OCR rendition's cap), or a DVB page's
+    ///   time-out where that is shorter — a ceiling and not an end, since the
+    ///   next page replaces the page. The host never holds a picture open
+    ///   waiting to be told to take it down. The cue therefore arrives up to
+    ///   its own length after its start on the stream's timeline; the demux
+    ///   runs up to 30 s ahead of what the player has fetched (read from the
+    ///   code, not measured), which is what makes that early enough. The first
+    ///   cue after a start or a seek into uncached territory can be late by
+    ///   that length.
+    /// - Times are on the player's clock like `TimedTextCue`'s: the source's
+    ///   presentation origin is subtracted and `subtitleDelaySeconds` applied.
+    /// - **The engine remembers nothing it delivered** — unlike
+    ///   `setTimedTextCueHandler`, a handler registered late is not replayed
+    ///   what came before. A two-hour film is some two thousand pictures, and
+    ///   a one-line rectangle of 700 x 60 pixels is 168 KB: keeping them all
+    ///   would be hundreds of megabytes. The host keeps what it needs near the
+    ///   playhead, and asks for cues again (`replayingFrom:`) where it needs
+    ///   cues the demux has already passed.
+    /// - **A cue can arrive more than once**: a region the producer reads again
+    ///   (a seek back, a replay) delivers its cues again as new images. Key
+    ///   them by `BitmapCue.id`.
+    /// - A seek (a re-anchor) ends every standing composition unseen and
+    ///   flushes the decoders: a picture decoded before the jump never reaches
+    ///   the host after it. PGS keeps its palettes and objects across packets
+    ///   within an epoch, so a decoder that joins mid-epoch may honestly
+    ///   produce nothing until the next epoch start.
+    /// - The OCR rendition is untouched. Selecting it in AVPlayer still arms
+    ///   the recognizer, and its text still reaches `setTimedTextCueHandler`
+    ///   — that is the fallback for what a host cannot draw (an external
+    ///   display, Picture in Picture, AirPlay). AVKit draws a selected
+    ///   rendition itself, so a host must not show the rendition and the
+    ///   pictures of one stream at once.
+    /// - Registered on a session that gets replaced after a master rejection,
+    ///   the handler and the chosen streams ride along to the replacement.
+    /// - The remux path only. The software path (`SoftwarePlaybackPipeline`)
+    ///   delivers no bitmap subtitles, as before.
+    ///
+    /// Not a stream (`AsyncStream`) for the reason `setTimedTextCueHandler` is
+    /// not: it is an endless feed with no terminus, and the host draws each
+    /// cue and forgets it.
+    public func setBitmapCueHandler(_ handler: (@Sendable (BitmapCue) -> Void)?) {
+        bitmapCueHandler = handler
+        remuxer.subtitles.setBitmapCueHandler(handler)
+    }
+
+    /// Choose the bitmap subtitle streams `setBitmapCueHandler` delivers
+    /// pictures for: the `streamIndex` of the tracks the probe reports as
+    /// `bitmapSubtitleTracks`. An empty set stops delivery and drops what was
+    /// standing; an index that is not a PGS, DVB or DVD stream of this source
+    /// is ignored.
+    ///
+    /// Callable before or after `start()`. **Before**, nothing else is needed:
+    /// the stream is decoded from its first packet. **After**, the demux is
+    /// wherever the producer is — up to 30 s past what the player has fetched —
+    /// and a stream chosen now has not seen the packets between the playhead
+    /// and there: its first cues would appear that much late. Pass `position`
+    /// to close that gap: the producer is asked to read the source again from
+    /// ten seconds before it (far enough back to catch a picture that began
+    /// before it and is still standing), and the cues from there arrive as it
+    /// does. Make the same call after the viewer **jumps back** into a
+    /// region the segment cache still holds — the producer only runs ahead of
+    /// the player, so segments that are on disk are not read again by
+    /// themselves, and their cues are not delivered again either.
+    ///
+    /// The re-read costs what a seek into uncached territory costs: the source
+    /// is read again from that point up to the producer's lead cap, and the
+    /// segments in between are made again (atomically, from the same cuts).
+    /// It is not free, so it is not done unless asked for.
+    ///
+    /// - Parameters:
+    ///   - streamIndices: the chosen streams, replacing the previous choice.
+    ///   - position: where the host needs cues from, in seconds on the player's
+    ///     clock — normally `AVPlayer.currentTime()`. `nil` asks for nothing
+    ///     to be read again.
+    /// - Returns: whether the producer was asked to read again. `false` when
+    ///   no position was given, nothing is chosen, the session has not started
+    ///   or has stopped, or the source has no segment plan to re-anchor in (a
+    ///   sequential session never re-anchors).
+    @discardableResult
+    public func setBitmapCueStreams(_ streamIndices: Set<Int>, replayingFrom position: Double? = nil) -> Bool {
+        bitmapCueStreams = streamIndices
+        remuxer.subtitles.setBitmapCueStreams(Set(streamIndices.compactMap { Int32(exactly: $0) }))
+        guard let position, started, !stopped, !streamIndices.isEmpty else { return false }
+        return remuxer.requestSubtitleReplay(fromPlayedSeconds: position)
     }
 
     // MARK: - Startup checkpoints

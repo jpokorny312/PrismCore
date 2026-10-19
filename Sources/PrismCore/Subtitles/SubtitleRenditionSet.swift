@@ -18,8 +18,9 @@ import Libavutil
 /// OCR (`BitmapSubtitleDecoder` + `SubtitleOCR`) — lossy by design, but the
 /// only form that rides PiP, AirPlay and the system menu. They stay reported
 /// by `SourceProbe` as host-only so a host that wants pixel-accurate rendering
-/// can still draw them itself; on a platform without Vision they are host-only
-/// in practice as well.
+/// can still draw them itself — as pictures, through the `bitmapTap`
+/// (`BitmapCue`), with or without an OCR rendition beside them; on a platform
+/// without Vision they are host-only in practice as well.
 final class SubtitleRenditionSet: @unchecked Sendable {
 
     /// Text subtitle codecs whose packets convert to WebVTT cues.
@@ -142,17 +143,29 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             stateLock.withLock { staleSegments.contains(index) }
         }
 
-        /// Decode one packet; returns every cue whose end became known.
-        /// Skips ALL work — decode included — until the track is armed.
-        func ingest(_ packet: UnsafeMutablePointer<AVPacket>) -> [SubtitleCue] {
-            guard isArmed, let decoder else { return [] }
-            return process(decoder.decode(packet))
+        /// Decode one packet, once, for whoever wants it: the OCR rendition
+        /// (`isArmed`) and the host's picture tap each read the events this
+        /// returns. The decoder carries epoch state, so a packet must never be
+        /// decoded for one reader and again for the other.
+        ///
+        /// - Parameter composeForOCR: build the recognizer's picture of each
+        ///   composition. Only an armed track needs it; a host tap alone does
+        ///   not pay for it.
+        func decode(
+            _ packet: UnsafeMutablePointer<AVPacket>, composeForOCR: Bool
+        ) -> [BitmapSubtitleDecoder.Event] {
+            decoder?.decode(packet, composeForOCR: composeForOCR) ?? []
         }
 
         /// The pending-cue lifecycle itself, decoder-independent.
         func process(_ events: [BitmapSubtitleDecoder.Event]) -> [SubtitleCue] {
             var closed: [SubtitleCue] = []
             for event in events {
+                // A composition that came without the recognizer's picture (too
+                // large to compose) is not a clear: it must neither end what
+                // stands nor stand itself. The decoder used to drop these
+                // before they got here; it now reports them, for the host tap.
+                if event.image == nil, !event.rects.isEmpty { continue }
                 if let open = pending {
                     // Whatever this event is, it ends what was showing.
                     closed.append(open.ending(at: min(event.startSeconds, open.start + Self.maximumCueSeconds)))
@@ -193,6 +206,12 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         /// stream may honestly produce nothing).
         func reanchor() {
             pending = nil
+            decoder?.flush()
+        }
+
+        /// The decoder alone forgets its epoch; the open cue stands, because
+        /// the clear that ends it needs no epoch to be read.
+        func flushDecoder() {
             decoder?.flush()
         }
     }
@@ -249,6 +268,37 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// delivered cue, a `.vtt` on disk — is rewritten.
     func setDelay(_ seconds: Double) {
         lock.withLock { storedDelaySeconds = SubtitleDelay.normalized(seconds) }
+        bitmapTap.setDelay(seconds)
+    }
+
+    // MARK: Host picture tap
+
+    /// The host's `BitmapCue` sink — the pictures of the bitmap streams the host
+    /// chose, with no recognizer in between. Independent of the OCR renditions
+    /// above: it decodes a stream that has no rendition (a source with a text
+    /// track beside its PGS, a platform without Vision) and it leaves the
+    /// renditions exactly as they were.
+    let bitmapTap = BitmapCueTap()
+
+    /// Bitmap streams that have no OCR rendition, each with a decoder of its
+    /// own, built in `prepare` so that choosing one later costs no I/O on the
+    /// producer's hot path. (A stream that does have a rendition reads through
+    /// that rendition's decoder instead: a decoder carries epoch state, so a
+    /// packet is decoded once and its events go to both readers.)
+    /// Written once in `prepare`, before any packet flows; read on the
+    /// producer thread only.
+    private var pictureOnlyDecoders: [Int32: BitmapSubtitleDecoder] = [:]
+
+    /// Register (or clear) the host's picture sink.
+    func setBitmapCueHandler(_ handler: (@Sendable (BitmapCue) -> Void)?) {
+        bitmapTap.setHandler(handler)
+    }
+
+    /// Choose the streams pictures are produced for; returns the streams that
+    /// were not chosen before.
+    @discardableResult
+    func setBitmapCueStreams(_ streams: Set<Int32>) -> Set<Int32> {
+        bitmapTap.setWanted(streams)
     }
 
     init(outputDirectory: URL) {
@@ -295,6 +345,10 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             if Self.kind(for: stream.pointee.codecpar.pointee.codec_id) != nil { hasTextTrack = true }
         }
 
+        // What a bitmap stream's coordinates are measured in when its codec
+        // does not say (see `BitmapSubtitleDecoder`): the video it plays over.
+        let videoFrameSize = Self.frameSize(ofFirstVideoStreamIn: input)
+
         for index in 0..<Int32(input.pointee.nb_streams) {
             guard let stream = input.pointee.streams[Int(index)] else { continue }
             let par = stream.pointee.codecpar.pointee
@@ -306,7 +360,8 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                 converter = .text(kind, playResolution: Self.playResolution(of: stream.pointee.codecpar, kind: kind))
             } else if Self.ocrCodecs.contains(par.codec_id), !hasTextTrack, SubtitleOCR.isAvailable,
                       let decoder = try? BitmapSubtitleDecoder(
-                        codecpar: stream.pointee.codecpar, timeBase: stream.pointee.time_base
+                        codecpar: stream.pointee.codecpar, timeBase: stream.pointee.time_base,
+                        fallbackFrameSize: videoFrameSize
                       ) {
                 // A bitmap track becomes a rendition through on-device OCR —
                 // lossy by design (typography dies, text survives), but it is
@@ -409,6 +464,27 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             )
         }
 
+        // Every bitmap stream the host tap could be asked for, rendition or not.
+        // The OCR renditions above exist only when the source has no text track
+        // and the platform has Vision; a viewer who picks a PGS track beside an
+        // SRT, or on a platform without Vision, still gets its pictures. Nothing
+        // is declared for these (no menu entry, no playlist) and nothing is
+        // decoded until the host chooses one.
+        var pictureOnly: [Int32: BitmapSubtitleDecoder] = [:]
+        for index in 0..<Int32(input.pointee.nb_streams) {
+            guard let stream = input.pointee.streams[Int(index)],
+                  stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE,
+                  Self.ocrCodecs.contains(stream.pointee.codecpar.pointee.codec_id),
+                  !built.contains(where: { $0.inputIndex == index }),
+                  let decoder = try? BitmapSubtitleDecoder(
+                    codecpar: stream.pointee.codecpar, timeBase: stream.pointee.time_base,
+                    fallbackFrameSize: videoFrameSize
+                  )
+            else { continue }
+            pictureOnly[index] = decoder
+        }
+        pictureOnlyDecoders = pictureOnly
+
         lock.withLock {
             tracks = built
             storedRenditions = Self.applyingPreferredDefault(
@@ -416,7 +492,24 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                 preferredLanguage: preferredLanguage
             )
         }
-        return Set(built.compactMap(\.inputIndex))
+        // The picture-only streams' packets have to reach `ingest` as well.
+        return Set(built.compactMap(\.inputIndex)).union(pictureOnly.keys)
+    }
+
+    /// The size of the first real video stream (not a cover picture), or `.zero`.
+    static func frameSize(ofFirstVideoStreamIn input: UnsafeMutablePointer<AVFormatContext>) -> CGSize {
+        for index in 0..<Int(input.pointee.nb_streams) {
+            guard let stream = input.pointee.streams[index],
+                  stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO,
+                  stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC == 0,
+                  stream.pointee.codecpar.pointee.width > 0, stream.pointee.codecpar.pointee.height > 0
+            else { continue }
+            return CGSize(
+                width: Int(stream.pointee.codecpar.pointee.width),
+                height: Int(stream.pointee.codecpar.pointee.height)
+            )
+        }
+        return .zero
     }
 
     /// Force every rendition's `NAME` to be unique within the group.
@@ -600,6 +693,8 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         if let handler {
             for cue in toDeliver { handler(cue) }
         }
+        // Same origin, same moment: the pictures rebase against it too.
+        bitmapTap.setOrigin(seconds: seconds)
     }
 
     // MARK: - Host cue tap
@@ -654,6 +749,16 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// tracked (a codec we neither convert nor OCR) are ignored.
     func ingest(_ packet: UnsafeMutablePointer<AVPacket>) {
         let streamIndex = Int32(packet.pointee.stream_index)
+
+        // A bitmap stream without a rendition exists for the host's pictures
+        // alone, and costs nothing until the host chooses it.
+        if let decoder = pictureOnlyDecoders[streamIndex] {
+            guard bitmapTap.wants(streamIndex) else { return }
+            if bitmapTap.takeFlush(streamIndex) { decoder.flush() }
+            bitmapTap.process(decoder.decode(packet, composeForOCR: false), streamIndex: streamIndex)
+            return
+        }
+
         guard let track = tracks.first(where: { $0.inputIndex == streamIndex }) else { return }
 
         switch track.converter {
@@ -662,12 +767,26 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         case .preloaded, .closedCaption:
             return
         case .bitmap(let bitmap):
+            // Two readers may want this packet — the OCR rendition once someone
+            // fetched it (lazy arming), the host's picture tap once the viewer
+            // chose the stream — and it is decoded once for both. With neither,
+            // ALL work is skipped, decode included.
+            let armed = bitmap.isArmed
+            let wantsPictures = bitmapTap.wants(streamIndex)
+            guard armed || wantsPictures else { return }
+            if wantsPictures, bitmapTap.takeFlush(streamIndex) { bitmap.flushDecoder() }
             // Bitmap events carry their own AV_TIME_BASE-derived times; the
             // decoder needs the packet even when its pts is unset (PGS spreads
             // one composition over several packets).
-            for cue in bitmap.ingest(packet) {
-                track.writer.add(cue)
-                emitHostCue(streamIndex: streamIndex, cue)
+            let events = bitmap.decode(packet, composeForOCR: armed)
+            if armed {
+                for cue in bitmap.process(events) {
+                    track.writer.add(cue)
+                    emitHostCue(streamIndex: streamIndex, cue)
+                }
+            }
+            if wantsPictures {
+                bitmapTap.process(events, streamIndex: streamIndex)
             }
         case .text(let kind, let playResolution):
             guard let timeBase = track.timeBase,
@@ -769,6 +888,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             }
             try track.writer.flushSegment(start: start, end: end, delaySeconds: delay)
         }
+        // The demux has read up to the cut. A picture nothing ended by now
+        // and whose latest end has passed is over; see `BitmapCueTap.advance`.
+        bitmapTap.advance(to: end)
     }
 
     /// Planned mode on every rendition (see `WebVTTRenditionWriter`).
@@ -789,6 +911,11 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             }
             track.writer.reanchor(segmentIndex: segmentIndex, startSeconds: startSeconds)
         }
+        // The picture tap's streams that have no rendition keep their decoders
+        // here, and every standing composition dies with the epoch it was
+        // decoded in: a picture from before the jump must not appear after it.
+        for decoder in pictureOnlyDecoders.values { decoder.flush() }
+        bitmapTap.reanchor()
     }
 
     /// `EXT-X-ENDLIST` on every rendition playlist.
@@ -796,6 +923,7 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         for track in tracks {
             try track.writer.finish()
         }
+        bitmapTap.finish()
     }
 
     // MARK: - Helpers
