@@ -39,6 +39,8 @@ struct PrismCoreCLI {
 
         probe:      --structure none|layout|full   (default layout)
         serve:      --for SECONDS                  stop on its own after SECONDS
+                    --delivery                     also print each segment served and what the
+                                                   source delivers (routine events, off by default)
         validate:   --require-validator            exit 69 when the validator is missing
                     --out DIR                      where the report goes (default ./prismcore-validation)
                     -- ARGS…                       passed to mediastreamvalidator verbatim

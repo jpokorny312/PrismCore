@@ -367,6 +367,18 @@ final class HLSRemuxer: @unchecked Sendable {
     /// cut path. `nil` in production.
     var onSegmentLanded: ((Int) -> Void)?
 
+    /// Called on the producer thread each time the copy loop has spent
+    /// `sourceReadWindow` seconds reading the source, with what the source
+    /// delivered in that time (`SourceReadMeter`). Set by `PrismCoreSession`
+    /// before the producer thread exists, like `onStartupPhase`, so the loop reads
+    /// it without a lock; `nil` for a remuxer built bare, and then the loop does
+    /// not measure at all.
+    var onSourceThroughput: ((SourceReadMeter.Reading) -> Void)?
+
+    /// Reading time that closes one window of `onSourceThroughput`. A knob for
+    /// tests: a fixture is read in milliseconds and would never fill a second.
+    var sourceReadWindow: Double = SourceReadMeter.defaultWindow
+
     /// The session's startup-checkpoint sink, called on the producer thread as
     /// each stage is reached. `nil` unless a host registered for them, and a
     /// nil check is the whole cost of that case.
@@ -409,8 +421,11 @@ final class HLSRemuxer: @unchecked Sendable {
         return sourceBytesReadStorage
     }
 
-    private func countSourceBytes(_ bytes: Int32, ptsSeconds: Double?) {
-        let now = ProcessInfo.processInfo.systemUptime
+    /// `now` is the instant the read returned, which the caller already took to
+    /// time the read: a second clock read per packet for the same moment.
+    private func countSourceBytes(
+        _ bytes: Int32, ptsSeconds: Double?, now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
         sourceBytesLock.lock()
         if bytes > 0 { sourceBytesReadStorage &+= Int64(bytes) }
         // Stamped under the byte counter's lock, which the packet already
@@ -443,6 +458,18 @@ final class HLSRemuxer: @unchecked Sendable {
         setProducerIdle(true)
         defer { setProducerIdle(false) }
         return body()
+    }
+
+    /// Bytes the I/O layer has pulled from the source so far
+    /// (`AVIOContext.bytes_read`), whichever reader sits under it — libavformat's
+    /// own HTTP, the coordinated reader or a host's input — or `nil` for a
+    /// context with no I/O layer, which can be timed but not measured.
+    ///
+    /// Not the packets' sizes (`sourceBytesRead`): the I/O layer also pulls the
+    /// container's framing, the bytes of a stream the demuxer reads past, and the
+    /// index it loads on the way, and all of that comes off the same link.
+    private static func bytesPulled(through context: UnsafeMutablePointer<AVFormatContext>) -> Int64? {
+        context.pointee.pb?.pointee.bytes_read
     }
 
     /// For a serve that has been waiting since `waitingSince` (uptime): a
@@ -1631,6 +1658,11 @@ final class HLSRemuxer: @unchecked Sendable {
         var packet = av_packet_alloc()
         defer { av_packet_free(&packet) }
         guard let packet else { return }
+        var readMeter = SourceReadMeter(window: sourceReadWindow)
+        // Read once: the property is set before this thread exists and never
+        // again, and a local keeps the closure out of the per-packet path.
+        let reportThroughput = onSourceThroughput
+        let metering = reportThroughput != nil
 
         // MARK: Copy loop
         // In planned mode the producer never truly ends at EOF: an earlier
@@ -1642,6 +1674,14 @@ final class HLSRemuxer: @unchecked Sendable {
         produce: while true {
             reachedEOF = false
             while !cancelled.isSet {
+                // Timed and counted around the read alone, so that what the
+                // source delivered is divided by the time the loop spent in the
+                // read — the demuxer's own work inside the call is in it, the
+                // muxing, the writing and a park are not (`SourceReadMeter`).
+                // Bytes the demuxer pulls outside this call (a seek's index, a
+                // re-anchor) are on neither side.
+                let readStarted = metering ? ProcessInfo.processInfo.systemUptime : 0
+                let pulledBefore = metering ? Self.bytesPulled(through: input) : nil
                 // Drained per packet: this loop runs on a plain `Thread` for
                 // the whole session and the thread never drains a pool of its
                 // own, so anything a read callback autoreleases — the
@@ -1676,12 +1716,18 @@ final class HLSRemuxer: @unchecked Sendable {
                         ?? interruptGuard.originFailure
                         ?? FFmpegError(code: readResult, operation: "av_read_frame")
                 }
+                let readEnded = ProcessInfo.processInfo.systemUptime
+                if metering, let pulledBefore, let pulledAfter = Self.bytesPulled(through: input),
+                   let reading = readMeter.record(bytes: pulledAfter - pulledBefore, seconds: readEnded - readStarted) {
+                    reportThroughput?(reading)
+                }
                 let readTimeBase = input.pointee.streams[Int(packet.pointee.stream_index)]!.pointee.time_base
                 countSourceBytes(
                     packet.pointee.size,
                     ptsSeconds: packet.pointee.pts == swift_AV_NOPTS_VALUE() || readTimeBase.den == 0
                         ? nil
-                        : Double(packet.pointee.pts) * Double(readTimeBase.num) / Double(readTimeBase.den)
+                        : Double(packet.pointee.pts) * Double(readTimeBase.num) / Double(readTimeBase.den),
+                    now: readEnded
                 )
                 defer { av_packet_unref(packet) }
 
