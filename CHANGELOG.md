@@ -214,6 +214,36 @@ source-compatible.)
 
 ### Fixed
 
+- **A whole-file keyframe index with a few long GOPs is planned, not declined.**
+  `SegmentPlan.keyframePlan` refused any index with a gap over 60 s
+  (`maxTrustedGapSeconds`), and a declined index plays the SEQUENTIAL shape: an
+  EVENT playlist with no duration, no seeking (a jump never lands, a resume
+  begins at 0:00) and the host's sequential workarounds. A real UHD HDR10 MOV
+  of 88 minutes (47.6 GB, `stss` read from the `moov` at the head: 3452 sync
+  samples, median gap 0.7 s) was declined for two gaps in its closing credits,
+  134 s and 130 s. `keyframePlan(indexReachesTheEnd:)` now tolerates gaps over
+  the cap when the caller has proved the index reaches the end of the container
+  (`indexCoversThroughEnd`), it is not a partial map, the median gap is within
+  one target, no gap is over 300 s (`maxToleratedGapSeconds`) and the long gaps
+  together are at most a quarter of the duration (`maxLongGapShareOfDuration`).
+  Anything else stays distrusted exactly as before (the callers that do not
+  pass the proof get the old behaviour).
+
+  What it does and does not do, measured on that file against the real server:
+  `plan 49ms (builtFromSource, 601 seg)` instead of `(sequential, 0 seg)`; the
+  playlist is VOD with TARGETDURATION 138 and the same cuts the sequential shape
+  made (2.1 s, 20.0 s, ...; 137.5 s and 130.2 s at the end); AVPlayer reports a
+  duration of 5257.4 s and seekable 0-5257 s, and a jump to 3000 s landed after
+  6 s, to 4990 s after 17 s. It does NOT make the first picture earlier: the
+  player takes the first ~190 MB either way (the file opens with an 18 s GOP), so
+  the start is that many megabytes divided by the source's speed (iOS 27
+  simulator: 6.5 s at 30 MB/s, 13 s at 15 MB/s, 0.7 s from a local file).
+  Known cost, unchanged by this change but now reachable by a jump: the two
+  credit segments are about 1 GB each, and `FMP4SegmentWriter` holds a segment in
+  memory while it is cut (peak 1.9 GB resident on the Mac for one of them).
+  Tried and dropped: finer head segments (1 s, and at every keyframe of the
+  first 4 s) did not change the start at all.
+
 - **A seek left the PGS decoder in its old epoch.** `BitmapSubtitleDecoder.flush()`
   called `avcodec_flush_buffers`, which only calls the codec's own flush hook,
   and libavcodec 62's PGS decoder does not clear its objects and palettes on

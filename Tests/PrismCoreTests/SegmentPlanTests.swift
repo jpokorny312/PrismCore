@@ -109,6 +109,70 @@ struct SegmentPlanTests {
         #expect(plan == nil)
     }
 
+    /// The real file of 2026-11-06 (a UHD HDR10 MOV, 88 minutes): 3452 sync samples with a median gap of 0.7 s
+    /// and two gaps of 134 s and 130 s inside the last five minutes. Scaled to a 30-minute film.
+    private func filmWithTwoLongGOPsAtTheEnd() -> [Int64] {
+        var keyframes: [Int64] = stride(from: 0, through: 1_200_000, by: 2_000).map(Int64.init)
+        keyframes += [1_330_000, 1_458_000]                                                        // gaps of 130 s and 128 s
+        keyframes += stride(from: 1_460_000, through: 1_798_000, by: 2_000).map(Int64.init)
+        return keyframes
+    }
+
+    @Test("A whole-file index with a cadence and two long GOPs is planned: the long gaps are real segments")
+    func longGOPsInAWholeFileIndexArePlanned() throws {
+        let entries = try #require(SegmentPlan.keyframePlan(
+            keyframes: filmWithTwoLongGOPsAtTheEnd(), durationSeconds: 1_800, tickSeconds: tick, targetSeconds: 6,
+            indexReachesTheEnd: true
+        ))
+        #expect(entries.first?.startPTS == 0)
+        #expect(entries.map(\.duration).max() == 130)
+        #expect(entries.contains { $0.startPTS == 1_200_000 && $0.duration == 130 })
+        #expect(entries.contains { $0.startPTS == 1_330_000 && $0.duration == 128 })
+        // Every second of the film is in exactly one entry.
+        #expect(abs(entries.map(\.duration).reduce(0, +) - 1_800) < 0.01)
+    }
+
+    @Test("The same index without the proof that it reaches the end stays distrusted")
+    func longGOPsWithoutTheProofStayDistrusted() {
+        #expect(SegmentPlan.keyframePlan(
+            keyframes: filmWithTwoLongGOPsAtTheEnd(), durationSeconds: 1_800, tickSeconds: tick, targetSeconds: 6
+        ) == nil)
+    }
+
+    @Test("A partial map never tolerates a gap over the cap, whatever the caller says")
+    func longGOPsInAPartialMapStayDistrusted() {
+        #expect(SegmentPlan.keyframePlan(
+            keyframes: filmWithTwoLongGOPsAtTheEnd(), durationSeconds: 1_800, tickSeconds: tick, targetSeconds: 6,
+            coveredThroughPTS: 1_460_000, indexReachesTheEnd: true
+        ) == nil)
+    }
+
+    @Test("An index with no cadence (the typical gap beyond one target) stays distrusted even when it reaches the end")
+    func sparseIndexStaysDistrusted() {
+        // A keyframe every 20 s, and one gap of 90 s: whatever this describes, it is not a cadence a seek can use.
+        var keyframes: [Int64] = stride(from: 0, through: 600_000, by: 20_000).map(Int64.init)
+        keyframes += stride(from: 690_000, through: 1_190_000, by: 20_000).map(Int64.init)
+        #expect(SegmentPlan.keyframePlan(
+            keyframes: keyframes, durationSeconds: 1_195, tickSeconds: tick, targetSeconds: 6, indexReachesTheEnd: true
+        ) == nil)
+    }
+
+    @Test("Long gaps that make up a large share of the film, or one beyond five minutes, stay distrusted")
+    func tooMuchLongGOPStaysDistrusted() {
+        // Half of the film inside two gaps of 250 s.
+        var share: [Int64] = stride(from: 0, through: 400_000, by: 2_000).map(Int64.init)
+        share += [650_000, 900_000, 998_000]
+        #expect(SegmentPlan.keyframePlan(
+            keyframes: share, durationSeconds: 1_000, tickSeconds: tick, targetSeconds: 6, indexReachesTheEnd: true
+        ) == nil)
+        // One gap of 350 s in an hour: a small share, but not a segment.
+        var single: [Int64] = stride(from: 0, through: 1_000_000, by: 2_000).map(Int64.init)
+        single += stride(from: 1_350_000, through: 3_598_000, by: 2_000).map(Int64.init)
+        #expect(SegmentPlan.keyframePlan(
+            keyframes: single, durationSeconds: 3_600, tickSeconds: tick, targetSeconds: 6, indexReachesTheEnd: true
+        ) == nil)
+    }
+
     @Test("Witness 2: head-bunched keyframes with no coverage distrust the index")
     func coverageWitness() {
         // All keyframes inside the first second (failed Cues tail read):

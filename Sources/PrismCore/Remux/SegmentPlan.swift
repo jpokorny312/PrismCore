@@ -56,6 +56,29 @@ struct SegmentPlan: Equatable {
     /// Generous: open-GOP 10 s intervals are real; 60 s is not a VOD cadence.
     static let maxTrustedGapSeconds = 60.0
 
+    /// The exception to the cap: a gap over it is a real long GOP, not junk, when the index is a
+    /// whole-file table with a cadence everywhere else. The cap guards against an index that is
+    /// not a description of the file (a head prefix, two bunched islands); a table that reaches
+    /// the end of the container (`indexCoversThroughEnd`), whose typical gap is within one target,
+    /// and in which the long gaps are a small share of the film, is exactly the opposite - the
+    /// demuxer read it from the container's own tables (MP4/MOV `stss`). A UHD remux with a few
+    /// minutes of near-static end credits in one GOP (the real file of 2026-11-06: gaps of 134 s
+    /// and 130 s in the last 5 minutes of an 88-minute film, median gap 0.7 s) was declined for
+    /// those two gaps alone and played SEQUENTIALLY: an EVENT playlist, no duration, no seeking (a
+    /// jump never lands, a resume begins at 0:00). Planned, the same file has its duration and can
+    /// be sought; its first picture takes the same time (measured in the iOS 27 simulator and on the
+    /// Mac: the player waits for the first ~190 MB either way, the 18 s GOP at the head of that file).
+    ///
+    /// The long entries are then real: the producer cuts at the keyframe at-or-after the boundary,
+    /// exactly as the sequential shape did, so a 134 s GOP is one 134 s segment either way (about
+    /// 1 GB at 60 Mbit/s, held in memory by `FMP4SegmentWriter` while it is cut: 1.9 GB resident
+    /// at the peak on the Mac), and TARGETDURATION is the ceiling of the longest entry (138 there).
+    ///
+    /// No single gap may exceed this many seconds ...
+    static let maxToleratedGapSeconds = 300.0
+    /// ... and all the gaps over the trusted cap together may take at most this share of the duration.
+    static let maxLongGapShareOfDuration = 0.25
+
     /// How long the FIRST segment aims to be, in seconds. Only the first: it
     /// is the one `start()` has to wait for, and under `delay_moov` the init
     /// segment does not exist until it is cut — so every second planned into
@@ -196,7 +219,12 @@ struct SegmentPlan: Equatable {
             tickSeconds: tick,
             targetSeconds: targetSeconds,
             firstSegmentSeconds: firstSegmentSeconds,
-            coveredThroughPTS: cachedKeyframes != nil ? cachedCoveredThroughPTS : nil
+            coveredThroughPTS: cachedKeyframes != nil ? cachedCoveredThroughPTS : nil,
+            // (A table that ends inside the last target of the duration is the whole file's - a
+            // map that is partial by construction says so through `cachedCoveredThroughPTS`.)
+            indexReachesTheEnd: keyframes.max().map {
+                indexCoversThroughEnd(lastKeyframePTS: $0, tickSeconds: tick, durationSeconds: durationSeconds, targetSeconds: targetSeconds)
+            } ?? false
         ) {
             return (SegmentPlan(
                 entries: planned,
@@ -301,17 +329,36 @@ struct SegmentPlan: Equatable {
         tickSeconds: Double,
         targetSeconds: Int,
         firstSegmentSeconds: Int? = nil,
-        coveredThroughPTS: Int64? = nil
+        coveredThroughPTS: Int64? = nil,
+        indexReachesTheEnd: Bool = false
     ) -> [Entry]? {
         let trusted = coveredThroughPTS.map { limit in keyframes.filter { $0 <= limit } } ?? keyframes
         guard trusted.count >= 2 else { return nil }
         let sorted = trusted.sorted()
 
-        // Witness 1: no gap over the cap.
+        // Witness 1: no gap over the cap - unless the index is a whole-file table with a cadence
+        // (`maxToleratedGapSeconds`): a few long GOPs are then long GOPs. `indexReachesTheEnd` is
+        // the caller's proof (`indexCoversThroughEnd`), never true for a partial map.
         var previous = sorted[0]
+        var gaps: [Int64] = []
+        gaps.reserveCapacity(sorted.count)
+        var longestGapSeconds = 0.0
+        var overTheCapSeconds = 0.0
         for keyframe in sorted.dropFirst() {
-            if Double(keyframe - previous) * tickSeconds > maxTrustedGapSeconds { return nil }
+            gaps.append(keyframe - previous)
+            let gapSeconds = Double(keyframe - previous) * tickSeconds
+            if gapSeconds > maxTrustedGapSeconds {
+                longestGapSeconds = max(longestGapSeconds, gapSeconds)
+                overTheCapSeconds += gapSeconds
+            }
             previous = keyframe
+        }
+        if longestGapSeconds > 0 {
+            let medianGapSeconds = Double(gaps.sorted()[gaps.count / 2]) * tickSeconds
+            guard indexReachesTheEnd, coveredThroughPTS == nil,
+                  longestGapSeconds <= maxToleratedGapSeconds,
+                  overTheCapSeconds <= durationSeconds * maxLongGapShareOfDuration,
+                  medianGapSeconds <= Double(targetSeconds) else { return nil }
         }
         // Witness 2: coverage spans at least one target duration.
         let span = Double(sorted.last! - sorted.first!) * tickSeconds
