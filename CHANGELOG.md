@@ -10,6 +10,94 @@ source-compatible.)
 
 ### Added
 
+- **`PrismCoreSession.audioRenditions`: which audio rendition of the served
+  master carries which source stream.** One `AudioRenditionInfo` per base
+  rendition - `streamIndex` (`AudioTrackInfo.streamIndex`: the container's own
+  index of the stream, the number media servers call `Stream #0:N` /
+  `MediaStream.Index`), `name` (the `NAME` of the master, which AVFoundation gives
+  the matching `AVMediaSelectionOption` as its `title` metadata item),
+  `language` (the tag the master declares, verbatim, `nil` for none) and
+  `isDefault` - in the order of the master. Additive: nothing that exists changed its behaviour, and the master
+  that is served is byte for byte the one it was.
+
+  Why: a host that lets the viewer pick an audio track has the track and has to
+  find its option in the audible selection group, and the only thing an option
+  carries that a host could compare is a language tag. A language is not an
+  identity. A film with two English tracks (a stereo mix and a 5.1 one, or a
+  commentary) has two options that match "English"; a host that selects the first
+  option of the language plays the wrong track whenever the second is picked, and
+  can never reach it. A track whose container tag is `und` (or missing) has an
+  option that matches no language at all, so it could not be picked by anybody.
+  The master has always named every option uniquely - AVPlayer refuses the whole
+  master when two `NAME`s collide, so `uniqueRenditionNames` numbers the second
+  "English" - but the names were nobody's to read: nothing said which stream a
+  name belongs to. Now the session says so, and a host selects the option whose
+  NAME is the reported `name` of the stream it wants. (A language tag
+  stays the right key for the AUTOMATIC choice at the start of a title - that is
+  `preferredAudioLanguage` - and the right fallback for a host that has no list
+  to read, e.g. the muxed shape.)
+
+  Details that matter to the reader of the list:
+
+  - **The NAME is the option's `title` metadata item - NOT its `displayName`.**
+    `option.commonMetadata` holds one `title` item (`commonKey == .commonKeyTitle`, identifier
+    `m3u8/NAME`) whose string is the printed NAME exactly, which is the way
+    `AVMediaSelectionGroup.h` documents for reading an option's name.
+    `displayName` is built from the option's language, locale and
+    characteristics, and takes a name from the metadata only when that item is
+    authored in the system's locale. Measured on macOS 27 in a process with a
+    German locale: two options with `LANGUAGE="eng"` and the NAMEs "English" and
+    "Englisch" are both "English"; `LANGUAGE="ces"` named "Tschechisch" is
+    "Czech"; an option with no `LANGUAGE` named "Audio 2" is "Unknown"
+    ("Unbekannt"). The options come in the master's order. The existing
+    `DialogueBoostRendition` documentation made the same `displayName` claim
+    and is corrected (documentation only).
+  - **The name is the one the playlist prints.** A `"` cannot stand in a quoted
+    attribute value, so the master folds it to `'` (`MasterPlaylistBuilder
+    .attributeValue`, which `quoted` now uses); the report goes through the same
+    fold. A track titled `Director's "cut"` is the option whose title is
+    `Director's 'cut'`, and a host comparing the container's raw title would
+    never find it (checked against the real AVFoundation, together with a title
+    holding a comma and non-ASCII letters).
+  - **One entry per rendition, in the master's order, whatever the names are.**
+    `uniqueRenditionNames` runs before the fold, so the one way two names can
+    still print alike is `A"B` beside `A'B`; the report keeps both entries, and a
+    host that wants to be exact pairs the k-th option of a name with the k-th
+    entry of that name.
+  - **Base renditions only.** A dialogue-boost rendition shares the stream of the
+    track it is derived from; a list keyed by stream index would name two options
+    for one track. Boosts keep their own report (`dialogueBoostRenditions`).
+  - **Only what the master carries.** A track this build can neither copy nor
+    bridge has no rendition (it never had one) and so no entry; the muxed shape
+    has no group to select in, and its list is empty.
+  - **Populated when the master lands**, i.e. any time after `start()` returns,
+    and `nonisolated` like `audioTrackDeliveries`: the producer writes it once,
+    under a lock.
+  - The statements that make the names unique and set `DEFAULT` moved out of
+    `HLSRemuxer.run` into `declareAudioRenditions` (unchanged, in the same
+    order) so that a test can drive them without a demuxer, and the report is
+    built from the very values the master is built from (`audioRenditionInfos`):
+    the two cannot disagree.
+
+  New tests (`AudioRenditionReportTests`): pure ones for two tracks of one
+  language ("English" / "English 2", each tied to its stream), two tracks both
+  titled "English" (the second is numbered, and a report built from two
+  renditions that print the same NAME still has two entries, in the master's
+  order), a track with no tag ("Audio 2", declared without `LANGUAGE`), titles
+  that collide only by case, the DEFAULT track leading the list whatever its
+  container position, boosts left out, the quote fold (the report's name is
+  inside the `NAME="…"` of a master built from the same renditions); and session
+  tests over `h264_multi_audio.mkv` - the report line by line against the master
+  the session wrote, the indexes against a probe of the source, the preferred
+  language moving DEFAULT, the muxed shape reporting nothing - and over variants
+  of it (the second track's tag patched in place from `ces` to `eng`, and to
+  `und`; the first track's title patched to one with a double quote and to one
+  with a comma and non-ASCII letters) that ask the real AVFoundation for the
+  audible group and check that the options' `title` metadata items are the
+  reported names, in the master's order (the options' `displayName`s are not
+  asserted: AVFoundation makes them from the language and the system's locale).
+  Run on macOS only, not on a device.
+
 - **Bitmap subtitles (PGS, DVB, DVD) reach the host as pictures, without text
   recognition.** `PrismCoreSession.setBitmapCueHandler(_:)` and
   `setBitmapCueStreams(_:replayingFrom:)` deliver the streams the viewer chose

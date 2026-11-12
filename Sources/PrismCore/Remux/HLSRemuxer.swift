@@ -560,6 +560,86 @@ final class HLSRemuxer: @unchecked Sendable {
         dialogueBoostLock.withLock { storedDialogueBoostRenditions }
     }
 
+    /// The BASE audio renditions the served master actually declares, each with
+    /// the source stream it carries (`AudioRenditionInfo`) — what a host reads
+    /// to find the `AVMediaSelectionOption` of a track by name instead of by a
+    /// language tag two tracks can share. Empty before the master lands, and
+    /// for a shape without one (muxed). Written once from the producer thread
+    /// when the master lands, read from anywhere.
+    private let audioRenditionsLock = NSLock()
+    private var storedAudioRenditions: [AudioRenditionInfo] = []
+
+    var audioRenditions: [AudioRenditionInfo] {
+        audioRenditionsLock.withLock { storedAudioRenditions }
+    }
+
+    /// How the master declares `renditions` (in their order): the names made
+    /// unique, `DEFAULT` on the first. These statements used to sit inline in
+    /// `run`; they are a function of their own so that a test can drive exactly
+    /// what the master is built from (same-language and untagged tracks)
+    /// without a demuxer, and so that `audioRenditionInfos` has one source of
+    /// truth to read the names from.
+    static func declareAudioRenditions(
+        _ renditions: [AudioRenditionWriter]
+    ) -> [MasterPlaylistBuilder.AudioRendition] {
+        // NAME must be unique within the group or AVPlayer rejects the
+        // whole master; two untitled tracks in one language would
+        // otherwise both be declared with the bare language name.
+        let uniqueNames = AudioRenditionWriter.uniqueRenditionNames(
+            renditions.map(\.derivedRenditionName)
+        )
+        for (rendition, name) in zip(renditions, uniqueNames) {
+            rendition.nameOverride = name
+        }
+        return renditions.enumerated().map { ordinal, rendition in
+            // DEFAULT on the first rendition only, which is the track
+            // `chooseAudio` would have picked (see `routeAll`) — and
+            // therefore the host's `preferredAudioLanguage` when one
+            // matched. Every other track is still declared and still
+            // selectable; the preference moves the flag, not the menu.
+            rendition.rendition(groupID: Self.audioGroupID, isDefault: ordinal == 0)
+        }
+    }
+
+    /// What the host is told of the audio renditions the master declares.
+    ///
+    /// `routes` and `declared` are parallel: `declared[i]` is how the master
+    /// describes the rendition that carries `routes[i]`, in the master's own
+    /// order (the order `declared` came out of `AudioRenditionWriter
+    /// .rendition(groupID:isDefault:)` in). Dialogue-boost renditions are left
+    /// out: they share `index` with the base rendition they are derived from,
+    /// so a list keyed by stream index would name two options for one track,
+    /// and they have their own report (`dialogueBoostRenditions`).
+    ///
+    /// The name is run through `MasterPlaylistBuilder.attributeValue`: the
+    /// playlist cannot carry a double quote in a `NAME`, so the option's `title`
+    /// metadata item (where AVFoundation puts the NAME) is the text AFTER that
+    /// fold, and a host comparing the raw container title would miss the option
+    /// it is looking for.
+    ///
+    /// One entry per declared base rendition, in the master's order, whatever the
+    /// names are: two renditions that happen to print the same NAME (the quote
+    /// fold can do that) stay two entries - the host tells them apart by their
+    /// order.
+    ///
+    /// Pure on purpose (same rule as `routeAll`): which name belongs to which
+    /// stream is exactly what must not drift, and it has to be testable
+    /// without a demuxer.
+    static func audioRenditionInfos(
+        routes: [AudioRoute],
+        declared: [MasterPlaylistBuilder.AudioRendition]
+    ) -> [AudioRenditionInfo] {
+        zip(routes, declared).compactMap { route, rendition in
+            guard route.mode.dialogueBoostLevel == nil else { return nil }
+            return AudioRenditionInfo(
+                streamIndex: Int(route.index),
+                name: MasterPlaylistBuilder.attributeValue(rendition.name),
+                language: rendition.language,
+                isDefault: rendition.isDefault
+            )
+        }
+    }
+
     /// The renditions of the running session, by directory name — what the
     /// loopback's demand seam arms (`noteAudioDemand`). Written once on the
     /// producer thread before the master lands; `arm()` itself is
@@ -1228,23 +1308,7 @@ final class HLSRemuxer: @unchecked Sendable {
                         renditions.filter(\.isLazy).map(\.playlistURI)
                     )
                 }
-                // NAME must be unique within the group or AVPlayer rejects the
-                // whole master; two untitled tracks in one language would
-                // otherwise both be declared with the bare language name.
-                let uniqueNames = AudioRenditionWriter.uniqueRenditionNames(
-                    renditions.map(\.derivedRenditionName)
-                )
-                for (rendition, name) in zip(renditions, uniqueNames) {
-                    rendition.nameOverride = name
-                }
-                variant.audioRenditions = renditions.enumerated().map { ordinal, rendition in
-                    // DEFAULT on the first rendition only, which is the track
-                    // `chooseAudio` would have picked (see `routeAll`) — and
-                    // therefore the host's `preferredAudioLanguage` when one
-                    // matched. Every other track is still declared and still
-                    // selectable; the preference moves the flag, not the menu.
-                    rendition.rendition(groupID: Self.audioGroupID, isDefault: ordinal == 0)
-                }
+                variant.audioRenditions = Self.declareAudioRenditions(renditions)
                 // The WebVTT renditions `prepare` set up above. Declaring them
                 // here is what makes them exist for AVPlayer: the segments are
                 // produced either way, but only the master's SUBTITLES group
@@ -1264,6 +1328,15 @@ final class HLSRemuxer: @unchecked Sendable {
                 // host, whose UI builds rows from this list.
                 let boostInfos = renditions.compactMap(\.dialogueBoostInfo)
                 dialogueBoostLock.withLock { storedDialogueBoostRenditions = boostInfos }
+                // The same for the base tracks: which option of the audible
+                // group is which source stream. Taken from the very values
+                // the master was just built from, so the report and the
+                // playlist cannot disagree (see `audioRenditionInfos`).
+                let audioInfos = Self.audioRenditionInfos(
+                    routes: renditions.map(\.route),
+                    declared: variant.audioRenditions
+                )
+                audioRenditionsLock.withLock { storedAudioRenditions = audioInfos }
             }
 
         case .muxed(let audio):

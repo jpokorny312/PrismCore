@@ -175,6 +175,28 @@ public actor PrismCoreSession {
     public nonisolated var audioDelivery: AudioDelivery { remuxer.audioDeliveryStore.summary }
     public nonisolated var audioTrackDeliveries: [AudioTrackDelivery] { remuxer.audioDeliveryStore.snapshot }
 
+    /// Which audio rendition of the served master carries which source stream:
+    /// the stream's index (`AudioTrackInfo.streamIndex`), the rendition's `NAME`,
+    /// its language tag and whether it is the `DEFAULT` one. A host that lets the
+    /// viewer pick a track selects the option whose NAME is the `name` of the
+    /// entry for that stream; that tells two tracks of one language apart and
+    /// finds a track that has no language tag at all, which a comparison of tags
+    /// cannot. The NAME of an `AVMediaSelectionOption` is its `title` metadata item
+    /// (`commonMetadata`, identifier `m3u8/NAME`) - NOT its `displayName`, which
+    /// AVFoundation makes from the language (see `AudioRenditionInfo`).
+    ///
+    /// Populated once the master is written, i.e. any time after `start()`
+    /// returns. Empty before that, for a session served in the muxed shape (the
+    /// one audio track rides in the video's own segments, there is no group to
+    /// select in), and for a source with no audio. Not every stream of
+    /// `audioTrackDeliveries` is in it: a track the master does not carry (no
+    /// way to copy or bridge it here) has no rendition, and a host then has
+    /// nothing to select for it. In the order of the master: the `DEFAULT`
+    /// track first. `nonisolated`, like `audioTrackDeliveries`: the list is
+    /// written once by the producer under a lock, and a host reading it while it
+    /// builds its menu should not have to hop onto the actor for that.
+    public nonisolated var audioRenditions: [AudioRenditionInfo] { remuxer.audioRenditions }
+
     /// Completed video intervals on the SOURCE timestamp axis, which may have
     /// a nonzero origin. Not AVPlayer.loadedTimeRanges. Poll for timeline UI.
     public nonisolated var residentRanges: [ResidentRange] { remuxer.residentSegments.ranges }
@@ -395,8 +417,10 @@ public actor PrismCoreSession {
     }
 
     /// The dialogue-boost renditions the served master actually declares —
-    /// level plus the exact `NAME`, which is the matching
-    /// `AVMediaSelectionOption.displayName`. Populated once the master is
+    /// level plus the exact `NAME`, which AVFoundation gives the matching
+    /// `AVMediaSelectionOption` as its `title` metadata item (`commonMetadata`,
+    /// identifier `m3u8/NAME`); the option's `displayName` is made from its
+    /// language and is not the NAME (see `AudioRenditionInfo`). Populated once the master is
     /// written (any time after `start()` returns); empty when none were
     /// requested, the build can't produce them, the default track has no
     /// centre channel, or the session fell back to the muxed shape. The

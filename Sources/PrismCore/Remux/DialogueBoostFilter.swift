@@ -39,7 +39,9 @@ public enum DialogueBoostLevel: String, CaseIterable, Sendable, Hashable {
 
 /// One produced dialogue-boost rendition, as the session reports it to the
 /// host: which level it carries and the exact `NAME` the master declares —
-/// which is the `displayName` of the matching `AVMediaSelectionOption`.
+/// which is the `title` metadata item (`commonMetadata`, identifier
+/// `m3u8/NAME`) of the matching `AVMediaSelectionOption`, not its `displayName`
+/// (AVFoundation makes that from the language; see `AudioRenditionInfo`).
 public struct DialogueBoostRendition: Sendable, Equatable {
     public let level: DialogueBoostLevel
     public let name: String

@@ -565,6 +565,18 @@ public enum MasterPlaylistBuilder {
     /// a track name (which came from container metadata) is folded to a
     /// single quote rather than emitted and breaking the parse.
     private static func quoted(_ value: String) -> String {
-        "\"" + value.replacingOccurrences(of: "\"", with: "'") + "\""
+        "\"" + attributeValue(value) + "\""
+    }
+
+    /// What `value` reads as once it has been printed into a quoted attribute
+    /// (`NAME="…"`) and parsed back - which is what AVFoundation reports as the
+    /// option's `title` metadata item (identifier `m3u8/NAME`; not its
+    /// `displayName`, which it makes from the language).
+    /// `PrismCoreSession.audioRenditions` reports names through this, so that the
+    /// string a host compares is the one the playlist says and not the
+    /// container's raw title: a track titled `Director's "cut"` is the option
+    /// whose title is `Director's 'cut'` (checked against the real AVFoundation).
+    static func attributeValue(_ value: String) -> String {
+        value.replacingOccurrences(of: "\"", with: "'")
     }
 }

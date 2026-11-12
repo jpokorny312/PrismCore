@@ -872,7 +872,42 @@ above 64 MiB also return `nil`. The image cache holds at most 16 MiB / 32 images
 
 `audioDelivery` summarizes available base routes, while `audioTrackDeliveries`
 lists each source track, including an unavailable one. The host owns actual
-AVPlayer track selection. A `.bridged` route describes its constructed pipeline;
+AVPlayer track selection, and `audioRenditions` is what it selects with: for each
+source stream the master carries, the `name` of its rendition (the NAME of the
+master, which AVFoundation gives the matching `AVMediaSelectionOption` as its
+`title` metadata item), its language tag and whether it is the `DEFAULT` one. Two
+tracks of one language - or a track with no language - cannot be told apart by a
+tag, but they have different names. **Read the name from the option's `title`
+metadata, not from `displayName`**: `displayName` is made from the option's
+language (two `LANGUAGE="eng"` options are both "English", an option with no
+language is "Unknown"), whatever the NAME says.
+
+```swift
+func name(of option: AVMediaSelectionOption) async -> String? {
+    let titles = option.commonMetadata.filter { $0.commonKey == .commonKeyTitle }
+    guard let title = titles.first(where: { $0.identifier?.rawValue == "m3u8/NAME" }) ?? titles.first else { return nil }
+    return try? await title.load(.stringValue)
+}
+
+let group = try await asset.loadMediaSelectionGroup(for: .audible)
+if let group, let rendition = session.audioRenditions.first(where: { $0.streamIndex == pickedStream }) {
+    for option in group.options {
+        if await name(of: option) == rendition.name {
+            item.select(option, in: group)
+            break
+        }
+    }
+}
+```
+
+`streamIndex` is the container's own index (`AudioTrackInfo.streamIndex`, which
+is also the `Index` of a Jellyfin `MediaStream`). Names are unique within the
+master (the one way two can still print alike is the fold of a `"` in a title to
+`'`); a host that wants to be exact there pairs the k-th option of a name with the
+k-th entry of that name - the options come in the master's order, as the list does.
+The list is empty for a session
+served in the muxed shape, and holds no dialogue-boost renditions (those are
+`dialogueBoostRenditions`). A `.bridged` route describes its constructed pipeline;
 its `bridge` counters show whether output has actually been produced. Zero
 output during priming is normal. A terminal, completely drained silent bridge
 raises `AudioBridgeFailure.producedNoAudio` through the session error path.
