@@ -42,12 +42,46 @@ public enum SourceOpenTuning {
     /// sources that were not going to answer.
     public static let probeBudget: Duration = .seconds(10)
 
+    /// The protocols libavformat may open **itself** for a source: a local file,
+    /// plain `http`, and the `tcp` it rides on — not `https`/`tls`, `crypto`,
+    /// `rtp`/`udp`, `rtsp` or anything else.
+    ///
+    /// Why (2026-11-13, the Ensō fork): FFmpeg's own TLS — GnuTLS in MPVKit's
+    /// build — takes **any** certificate. A host reads an `https` address
+    /// through its own reader (a `PrismCoreInput`, `URLSession` in Ensō), which
+    /// checks the server's certificate; what is left for FFmpeg to open is a
+    /// plain `http` address or a file. Without a whitelist FFmpeg would also
+    /// follow a redirect from such an address to `https` and read it with its
+    /// own TLS: a stream, and whatever credential rides in its address or its
+    /// headers, without a certificate check. With it, an address that needs a
+    /// protocol outside the list fails with "Protocol '…' not on whitelist"
+    /// **before** a connection is made (the whitelist is also checked for every
+    /// redirect target).
+    public static let protocolWhitelist = "file,http,tcp"
+
+    /// How many redirects FFmpeg's http may follow when it opens a source
+    /// itself: **none** (FFmpeg's default is 8). An address that redirects is
+    /// not the address of the stream, and the credential in it must not follow
+    /// a `Location` header to another host; the host resolves the address it
+    /// means before it hands it over.
+    public static let maxRedirects = 0
+
+    /// Sets the two policies above on an options dictionary of an open.
+    /// Every `avformat_open_input` that is given a URL carries it
+    /// (`makeOptions` does it; a test scans for the opens that do not).
+    static func applyProtocolPolicy(to options: inout OpaquePointer?) {
+        av_dict_set(&options, "protocol_whitelist", protocolWhitelist, 0)
+        av_dict_set(&options, "max_redirects", String(maxRedirects), 0)
+    }
+
     /// The options every open should carry: the caller's HTTP headers, the
-    /// reconnect policy the demux side needs, and the caps above.
+    /// reconnect policy the demux side needs, the caps above and the protocol
+    /// policy (`protocolWhitelist`, `maxRedirects`).
     ///
     /// Returns an owned dictionary — the caller frees it with `av_dict_free`.
     static func makeOptions(httpHeaders: [String: String]) -> OpaquePointer? {
         var options: OpaquePointer?
+        applyProtocolPolicy(to: &options)
         if !httpHeaders.isEmpty {
             let headerBlob = httpHeaders.map { "\($0.key): \($0.value)\r\n" }.joined()
             av_dict_set(&options, "headers", headerBlob, 0)

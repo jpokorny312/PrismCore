@@ -20,6 +20,7 @@ enum SegmentPlanProbe {
 
         var options: OpaquePointer?
         defer { av_dict_free(&options) }
+        SourceOpenTuning.applyProtocolPolicy(to: &options)
         if !httpHeaders.isEmpty {
             let blob = httpHeaders.map { "\($0.key): \($0.value)\r\n" }.joined()
             av_dict_set(&options, "headers", blob, 0)
